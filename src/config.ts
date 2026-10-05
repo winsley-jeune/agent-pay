@@ -39,4 +39,10 @@ export const config = {
   vaultUnlockDelayHours: Number(process.env.VAULT_UNLOCK_DELAY_HOURS ?? 24),
   // The most AgentPay refunds per incident it covers. 0 = no guarantee published yet (a legal decision first).
   guaranteeMaxCents: Number(process.env.GUARANTEE_MAX_CENTS ?? 0),
+  // Optional: send invitations by email (https://resend.com) and text message (https://twilio.com).
+  resendApiKey: process.env.RESEND_API_KEY ?? "",
+  emailFrom: process.env.EMAIL_FROM ?? "",
+  twilioAccountSid: process.env.TWILIO_ACCOUNT_SID ?? "",
+  twilioAuthToken: process.env.TWILIO_AUTH_TOKEN ?? "",
+  twilioFrom: process.env.TWILIO_FROM ?? "",
 };

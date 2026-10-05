@@ -7,7 +7,11 @@ Running AgentPay for yourself is the simplest way to use it. It's your server, y
 - Node 20+ and PostgreSQL 15+ (17 is what the repo uses)
 - An HTTPS domain. Passkeys only work over HTTPS, except on `localhost`.
 - A Stripe account. Use **test mode** until you've reviewed the legal side.
-- Optional: an Anthropic API key (reading grocery-list photos) and a Keepa key (Amazon prices)
+- Optional:
+  - an Anthropic API key (reading grocery-list photos)
+  - a Keepa key (Amazon prices)
+  - a Resend key (email invitations)
+  - a Twilio account (text invitations; US texting needs A2P 10DLC registration)
 
 ## Steps
 

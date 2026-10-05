@@ -7,7 +7,9 @@ import {
   alertsFor,
   cancelChange,
   getProtection,
+  inviteChannels,
   inviteHelper,
+  resendInvite,
   leave,
   listChanges,
   listHelpers,
@@ -37,6 +39,7 @@ export function familyRoutes(db: Db) {
       helpers: await listHelpers(db, me(req)),
       scheduledChanges: await listChanges(db, me(req)),
       helping: await listHelping(db, me(req)),
+      inviteChannels: inviteChannels(),
     })),
   );
   r.put("/name", h(async (req) => setDisplayName(db, me(req), parse(z.object({ name: z.string().max(80) }), req.body).name)));
@@ -47,7 +50,17 @@ export function familyRoutes(db: Db) {
         parse(z.object({ enabled: z.boolean().optional(), cosignThresholdCents: z.number().int().min(0).max(10_000_000).optional(), cosignDelayHours: z.number().int().min(1).max(720).optional() }), req.body)),
     ),
   );
-  r.post("/helpers", h(async (req) => inviteHelper(db, me(req), parse(z.object({ label: z.string().min(1).max(80) }), req.body).label)));
+  r.post(
+    "/helpers",
+    h(async (req) => {
+      const { label, email, phone } = parse(
+        z.object({ label: z.string().min(1).max(80), email: z.string().max(254).optional(), phone: z.string().max(32).optional() }),
+        req.body,
+      );
+      return inviteHelper(db, me(req), label, { email: email || undefined, phone: phone || undefined });
+    }),
+  );
+  r.post("/helpers/:id/resend", h(async (req) => resendInvite(db, me(req), String(req.params.id))));
   r.delete("/helpers/:id", h(async (req) => removeHelper(db, me(req), String(req.params.id))));
   r.delete(
     "/changes/:id",

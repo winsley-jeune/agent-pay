@@ -4,6 +4,8 @@ import { hashToken, updateAgentKeyLimits, type AgentKeyLimits } from "./auth.js"
 import type { Db, Tx } from "./db.js";
 import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
+import { config } from "./config.js";
+import { channelConfigured, DAILY_SEND_LIMIT, maskContact, normalizeEmail, normalizePhone, send, sentInLastDay, type Delivery } from "./notify.js";
 
 // Protected accounts and trusted helpers, for people who want someone they
 // trust (an adult child, a caregiver) watching over their agents' spending.
@@ -67,27 +69,121 @@ async function activeHelperCount(q: Db | Tx, ownerId: string): Promise<number> {
   return rows[0].n;
 }
 
-/** Invite someone to help. The code is shown once; they accept it from their own AgentPay account. */
-export async function inviteHelper(db: Db, ownerId: string, label: string) {
+export interface InviteContact {
+  email?: string;
+  phone?: string;
+}
+
+/** The invitation text. The link uses the URL fragment (#), which browsers never send to a server. */
+function inviteMessage(ownerName: string, code: string) {
+  const link = `${config.publicUrl}/#accept=${code}`;
+  return {
+    subject: `${ownerName} invited you to be a trusted helper on AgentPay`,
+    email:
+      `${ownerName} invited you to be a trusted helper on their AgentPay account.\n\n` +
+      `As a trusted helper you can see what their AI agents spend, freeze everything if something looks wrong, and co-sign or object to big payments. ` +
+      `You can never spend their money or approve anything alone.\n\n` +
+      `To accept, sign in to AgentPay (or create an account) and open:\n${link}\n\n` +
+      `Or enter this code on the Family tab: ${code}\n\nThe invitation expires in ${INVITE_DAYS} days. ` +
+      `If you don't know ${ownerName}, ignore this message.`,
+    sms: `${ownerName} invited you to be a trusted helper on AgentPay (see and protect their agents' spending; you can't spend their money). Accept within ${INVITE_DAYS} days: ${link} If you don't know them, ignore this.`,
+  };
+}
+
+async function deliverInvite(db: Db, ownerId: string, helperRowId: string, contactType: "email" | "phone", contact: string, code: string): Promise<Delivery> {
+  const { rows } = await db.query("SELECT COALESCE(display_name, email) AS name FROM users WHERE id = $1", [ownerId]);
+  const msg = inviteMessage(rows[0].name, code);
+  const delivery = await send(db, ownerId, {
+    channel: contactType === "email" ? "email" : "sms", to: contact, subject: msg.subject, text: contactType === "email" ? msg.email : msg.sms, purpose: "helper_invite",
+  });
+  await db.query(
+    "UPDATE helpers SET delivery_status = $2, delivered_at = CASE WHEN $2 = 'sent' THEN now() END, delivery_error = $3 WHERE id = $1",
+    [helperRowId, delivery.status, delivery.error ?? null],
+  );
+  return delivery;
+}
+
+function inviteResult(helperRowId: string, code: string, contactType: "email" | "phone" | null, contact: string | null, delivery: Delivery | null) {
+  const to = contactType && contact ? maskContact(contactType, contact) : null;
+  const note =
+    delivery?.status === "sent"
+      ? `Invitation sent to ${to}. You can also give them this code; it works once.`
+      : delivery?.status === "failed"
+        ? `Couldn't send to ${to} (${delivery.error}). Give them this code yourself; it works once and is shown only now.`
+        : contactType
+          ? `Sending ${contactType === "email" ? "email" : "text messages"} isn't set up on this server. Give ${to} this code yourself; it works once and is shown only now.`
+          : "Give this code to your helper; it works once and is shown only now.";
+  return { helperRowId, code, expiresInDays: INVITE_DAYS, sentTo: delivery?.status === "sent" ? to : null, delivery: delivery?.status ?? null, note };
+}
+
+/**
+ * Invite someone to help, optionally by email or phone number. AgentPay sends
+ * the invitation when that channel is configured; the code is also returned
+ * once, so the owner can pass it on themselves. An email invitation can only
+ * be accepted from an AgentPay account with that email address.
+ */
+export async function inviteHelper(db: Db, ownerId: string, label: string, contact: InviteContact = {}) {
+  if (contact.email && contact.phone) throw new AppError(400, "one_contact", "give an email address or a phone number, not both");
+  const contactType = contact.email ? "email" : contact.phone ? "phone" : null;
+  const value = contact.email ? normalizeEmail(contact.email) : contact.phone ? normalizePhone(contact.phone) : null;
   if ((await activeHelperCount(db, ownerId)) >= MAX_HELPERS) throw new AppError(409, "too_many_helpers", `an account can have at most ${MAX_HELPERS} helpers`);
+  if (value) {
+    const self = await db.query("SELECT 1 FROM users WHERE id = $1 AND email = $2", [ownerId, value]);
+    if (self.rowCount) throw new AppError(400, "own_account", "you can't be a helper on your own account");
+    const dup = await db.query("SELECT 1 FROM helpers WHERE owner_id = $1 AND contact = $2 AND status IN ('invited','active','removing')", [ownerId, value]);
+    if (dup.rowCount) throw new AppError(409, "already_invited", "you already invited this person; resend the invitation instead");
+    // Check the daily limit before creating anything, so a refused send leaves no half-made invitation.
+    if (channelConfigured(contactType === "email" ? "email" : "sms") && (await sentInLastDay(db, ownerId)) >= DAILY_SEND_LIMIT) {
+      throw new AppError(429, "send_limit", `at most ${DAILY_SEND_LIMIT} messages a day; try again tomorrow`);
+    }
+  }
   const code = `ap_invite_${randomBytes(18).toString("base64url")}`;
   const { rows } = await db.query(
-    `INSERT INTO helpers (owner_id, label, invite_hash, invite_expires_at) VALUES ($1, $2, $3, now() + make_interval(days => $4)) RETURNING id`,
-    [ownerId, label.slice(0, 80), hashToken(code), INVITE_DAYS],
+    `INSERT INTO helpers (owner_id, label, invite_hash, invite_expires_at, contact_type, contact)
+     VALUES ($1, $2, $3, now() + make_interval(days => $4), $5, $6) RETURNING id`,
+    [ownerId, label.slice(0, 80), hashToken(code), INVITE_DAYS, contactType, value],
   );
-  return { helperRowId: rows[0].id as string, code, expiresInDays: INVITE_DAYS, note: "Give this code to your helper; it works once and is shown only now." };
+  const id: string = rows[0].id;
+  const delivery = contactType && value ? await deliverInvite(db, ownerId, id, contactType, value, code) : null;
+  return inviteResult(id, code, contactType, value, delivery);
+}
+
+/** Send a fresh invitation: a new code and a new expiry (the old code stops working). */
+export async function resendInvite(db: Db, ownerId: string, helperRowId: string) {
+  const { rows } = await db.query(
+    `SELECT id, contact_type AS "contactType", contact FROM helpers WHERE id = $1 AND owner_id = $2 AND status = 'invited'`,
+    [helperRowId, ownerId],
+  );
+  const h = rows[0];
+  if (!h) throw new AppError(404, "not_found", "no open invitation with that id");
+  const code = `ap_invite_${randomBytes(18).toString("base64url")}`;
+  await db.query("UPDATE helpers SET invite_hash = $2, invite_expires_at = now() + make_interval(days => $3) WHERE id = $1", [h.id, hashToken(code), INVITE_DAYS]);
+  const delivery = h.contactType ? await deliverInvite(db, ownerId, h.id, h.contactType, h.contact, code) : null;
+  return inviteResult(h.id, code, h.contactType, h.contact, delivery);
+}
+
+/** Which invitation channels this server can send on. */
+export function inviteChannels() {
+  return { email: channelConfigured("email"), sms: channelConfigured("sms") };
 }
 
 export async function acceptInvite(db: Db, helperUserId: string, code: string) {
   return withTx(db, async (tx) => {
     const { rows } = await tx.query(
-      `SELECT id, owner_id AS "ownerId", label FROM helpers
+      `SELECT id, owner_id AS "ownerId", label, contact_type AS "contactType", contact FROM helpers
         WHERE invite_hash = $1 AND status = 'invited' AND invite_expires_at > now() FOR UPDATE`,
       [hashToken(code.trim())],
     );
     const h = rows[0];
     if (!h) throw new AppError(404, "invite_invalid", "this invite code is wrong, used or expired");
     if (h.ownerId === helperUserId) throw new AppError(400, "own_account", "you can't be a helper on your own account");
+    // An email invitation is for that person: only their AgentPay account can accept it.
+    if (h.contactType === "email") {
+      const me = await tx.query("SELECT email FROM users WHERE id = $1", [helperUserId]);
+      if (me.rows[0].email !== h.contact) {
+        throw new AppError(403, "wrong_account", `this invitation was sent to ${maskContact("email", h.contact)}; sign in with that email address to accept it`);
+      }
+    }
     if (await helperOn(tx, helperUserId, h.ownerId)) throw new AppError(409, "already_helping", "you already help on this account");
     await tx.query("UPDATE helpers SET helper_id = $2, status = 'active', invite_hash = NULL, accepted_at = now() WHERE id = $1", [h.id, helperUserId]);
     await auditTx(tx, h.ownerId, { actor: "helper", kind: "helper_change", summary: `${h.label} accepted the invitation and can now see and protect this account` });
@@ -97,7 +193,8 @@ export async function acceptInvite(db: Db, helperUserId: string, code: string) {
 
 export async function listHelpers(q: Db | Tx, ownerId: string) {
   const { rows } = await q.query(
-    `SELECT h.id, h.label, h.status, u.email, h.created_at AS "createdAt", h.accepted_at AS "acceptedAt", h.invite_expires_at AS "inviteExpiresAt",
+    `SELECT h.id, h.label, h.status, u.email, h.contact_type AS "contactType", h.contact, h.delivery_status AS "deliveryStatus",
+            h.delivered_at AS "deliveredAt", h.created_at AS "createdAt", h.accepted_at AS "acceptedAt", h.invite_expires_at AS "inviteExpiresAt",
             (SELECT effective_at FROM account_changes c WHERE c.target_id = h.id AND c.kind = 'remove_helper' AND c.status = 'scheduled' LIMIT 1) AS "removingAt"
        FROM helpers h LEFT JOIN users u ON u.id = h.helper_id
       WHERE h.owner_id = $1 AND h.status <> 'removed' ORDER BY h.created_at`,

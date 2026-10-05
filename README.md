@@ -208,6 +208,12 @@ Ideas from agent payments in Asia ([docs/asia.md](docs/asia.md)), built for one 
 
 For people who want someone they trust watching over their agents' spending: an older parent and an adult child, someone recovering from illness, anyone who has been targeted by scams.
 
+- **Inviting a helper.** Invite them **by email or by text message** (or just get a code to pass on).
+  - **How it's sent:** email goes through [Resend] and texts through [Twilio] once configured (see Configuration). Without them, the owner gets the code to share.
+  - **The link:** it carries the code in the `#` part of the address, which browsers never send to a server.
+  - **Who can accept:** an email invitation only from the AgentPay account with that email address. A text invitation works for whoever holds the code.
+  - **Limits:** invitations expire after 7 days; "Resend" issues a new code and the old one stops working; owners can cause at most 10 messages a day.
+  - **What's stored:** every send is recorded without the code.
 - **The owner keeps their money.** A **trusted helper** (up to 3) accepts an invitation from their own AgentPay account. A helper can:
   - see the account: Control board, why log, approvals, subscriptions
   - freeze it
@@ -314,6 +320,8 @@ The owner can't turn this off; they buy these themselves.
 | `DRAIN_GUARD` / `DRAIN_GUARD_MIN_CENTS` | `true` / `2000` | Ask when an hour of one agent's spending would be more than half the wallet |
 | `VAULT_UNLOCK_DELAY_HOURS` | `24` | Wait between approving a vault unlock and the money moving |
 | `GUARANTEE_MAX_CENTS` | `0` | Refund guarantee per incident. 0 = none offered |
+| `RESEND_API_KEY` / `EMAIL_FROM` | empty | Send helper invitations by email ([Resend]); `EMAIL_FROM` like `AgentPay <hello@yourdomain.com>` on a domain verified with Resend |
+| `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM` | empty | Send helper invitations by text message ([Twilio]); `TWILIO_FROM` is your Twilio number in +1… form. US texting needs A2P 10DLC registration with Twilio |
 
 ## Not production-ready yet
 
@@ -330,3 +338,6 @@ This is a working MVP. Before handling real money:
 - [CONTRIBUTING.md](CONTRIBUTING.md): setup, and the rules for changes that touch money
 - [SECURITY.md](SECURITY.md): report vulnerabilities privately
 - [LICENSING.md](LICENSING.md): the server and dashboard are [AGPL-3.0](LICENSE); the MCP server, Claude Code plugin and policy rules are [MIT](LICENSE-MIT)
+
+[Resend]: https://resend.com
+[Twilio]: https://www.twilio.com

@@ -78,6 +78,13 @@ let token = null;
 try { token = localStorage.getItem("agentpay.token"); } catch {}
 let me = null;
 let tab = location.hash.slice(1) || "board";
+// An invitation link (#accept=<code>): keep the code in memory only, open the Family tab, and take it out of the address bar.
+let pendingInvite = null;
+if (tab.startsWith("accept=")) {
+  pendingInvite = decodeURIComponent(tab.slice(7));
+  tab = "family";
+  history.replaceState(null, "", "#family");
+}
 // Trusted helper mode: the ownerId of the account we're helping, or null for our own account.
 let acting = null;
 try { acting = sessionStorage.getItem("agentpay.acting") || null; } catch {}
@@ -400,12 +407,21 @@ async function familyTab() {
     <div class="card"><h3>Trusted helpers</h3>
       <div class="table-wrap"><table><tr><th>Helper</th><th>Status</th><th></th></tr>
         ${f.helpers.map((h) => { const [l, c] = helperState[h.status] ?? [h.status, ""]; return `<tr>
-          <td><b>${esc(h.label)}</b><div class="small muted">${h.email ? esc(h.email) : `invite sent${h.inviteExpiresAt ? ` · expires ${date(h.inviteExpiresAt)}` : ""}`}</div></td>
+          <td><b>${esc(h.label)}</b><div class="small muted">${h.email ? esc(h.email) : `${h.contact ? `${h.deliveryStatus === "sent" ? "invitation sent to" : "invited:"} ${esc(h.contact)}` : "invite code given"}${h.deliveryStatus === "failed" ? ` <span class="chip bad">couldn't send</span>` : ""}${h.inviteExpiresAt ? ` · expires ${date(h.inviteExpiresAt)}` : ""}`}</div></td>
           <td><span class="chip ${c}">${esc(l)}</span>${h.removingAt ? `<div class="small muted">removed on ${date(h.removingAt)}</div>` : ""}</td>
-          <td>${h.status === "removing" ? "" : `<button class="danger" data-rm-helper="${esc(h.id)}" data-label="${esc(h.label)}">Remove</button>`}</td></tr>`; }).join("")
+          <td class="row">${h.status === "invited" ? `<button data-resend="${esc(h.id)}" data-label="${esc(h.label)}">${h.contact ? "Resend" : "New code"}</button>` : ""}${h.status === "removing" ? "" : `<button class="danger" data-rm-helper="${esc(h.id)}" data-label="${esc(h.label)}">Remove</button>`}</td></tr>`; }).join("")
           || `<tr><td colspan="3" class="muted small">No trusted helpers yet.</td></tr>`}
       </table></div>
-      <div class="row" style="margin-top:10px"><input id="helperlabel" placeholder="Maria (daughter)" maxlength="80"><button class="primary" id="invite">Invite a helper</button></div>
+      <div class="grid" style="margin-top:10px">
+        <label>Their name<input id="helperlabel" placeholder="Maria (daughter)" maxlength="80"></label>
+        <label>Send the invitation by<select id="invitehow">
+          <option value="email">Email${f.inviteChannels?.email ? "" : " (you'll pass on the code)"}</option>
+          <option value="phone">Text message${f.inviteChannels?.sms ? "" : " (you'll pass on the code)"}</option>
+          <option value="code">Just give me a code</option></select></label>
+        <label id="contactlabel">Email address<input id="helpercontact" type="email" placeholder="maria@example.com" maxlength="254" autocomplete="off"></label>
+      </div>
+      <div class="row"><button class="primary" id="invite">Invite a helper</button></div>
+      <p class="small muted">An email invitation can only be accepted from an AgentPay account with that email address. A text invitation works for whoever has the code, so send it only to their own phone.</p>
       <div id="invitecode"></div>
     </div>
     <div class="card"><h3>Accounts you help</h3>
@@ -422,7 +438,8 @@ async function familyTab() {
     </div>
     <div class="card"><h3>Accept an invitation</h3>
       <p class="small muted">Someone asked you to be their trusted helper? Paste the code they gave you.</p>
-      <div class="row"><input id="invitein" placeholder="Invitation code" autocomplete="off" style="flex:1;min-width:180px"><button class="primary" id="accept">Accept</button></div>
+      ${pendingInvite ? `<p class="small" style="color:var(--warn)">You opened an invitation link. Check you're signed in to the right AgentPay account (for an email invitation, the one with that email address), then press Accept.</p>` : ""}
+      <div class="row"><input id="invitein" placeholder="Invitation code" autocomplete="off" style="flex:1;min-width:180px" value="${esc(pendingInvite ?? "")}"><button class="primary" id="accept">Accept</button></div>
     </div>`;
 
   const on = (sel, fn) => $(sel) && ($(sel).onclick = act(fn));
@@ -436,17 +453,38 @@ async function familyTab() {
   });
   el.querySelectorAll("[data-cancel-change]").forEach((b) => (b.onclick = act(async () => { await api("DELETE", `/api/family/changes/${b.dataset.cancelChange}`, undefined, { own: true }); toast("Cancelled."); await again(); })));
   on("#savename", async () => { await api("PUT", "/api/family/name", { name: $("#famname").value.trim() }, { own: true }); toast("Name saved."); });
-  on("#invite", async () => {
-    const label = $("#helperlabel").value.trim();
-    if (!label) return toast("Give your helper a name first, like \"Maria (daughter)\".");
-    const r = await api("POST", "/api/family/helpers", { label }, { own: true });
-    await refreshCounts(); await familyTab();
+  const how = $("#invitehow");
+  if (how) how.onchange = () => {
+    const v = how.value;
+    $("#contactlabel").style.display = v === "code" ? "none" : "";
+    $("#contactlabel").firstChild.textContent = v === "phone" ? "Mobile number" : "Email address";
+    $("#helpercontact").type = v === "phone" ? "tel" : "email";
+    $("#helpercontact").placeholder = v === "phone" ? "(555) 123-4567" : "maria@example.com";
+  };
+  const showCode = (label, r) => {
     $("#invitecode").innerHTML = `<div class="code-box"><b class="small">Invitation code for ${esc(label)} (shown once)</b>
       <pre id="codetext">${esc(r.code)}</pre>
       <div class="row"><button id="copycode">Copy code</button><span class="small muted">Expires in ${esc(r.expiresInDays)} days</span></div>
       <p class="small">${esc(r.note || "Give this to your helper; they accept it from their own AgentPay account.")}</p></div>`;
     $("#copycode").onclick = async () => { try { await navigator.clipboard.writeText(r.code); toast("Copied."); } catch { toast("Select the code and copy it."); } };
+  };
+  on("#invite", async () => {
+    const label = $("#helperlabel").value.trim();
+    if (!label) return toast("Give your helper a name first, like \"Maria (daughter)\".");
+    const v = $("#invitehow").value;
+    const contact = $("#helpercontact").value.trim();
+    if (v !== "code" && !contact) return toast(v === "phone" ? "Enter their mobile number." : "Enter their email address.");
+    const r = await api("POST", "/api/family/helpers", { label, ...(v === "email" ? { email: contact } : v === "phone" ? { phone: contact } : {}) }, { own: true });
+    if (r.sentTo) toast(`Invitation sent to ${r.sentTo}.`);
+    await refreshCounts(); await familyTab();
+    showCode(label, r);
   });
+  el.querySelectorAll("[data-resend]").forEach((b) => (b.onclick = act(async () => {
+    const r = await api("POST", `/api/family/helpers/${b.dataset.resend}/resend`, {}, { own: true });
+    if (r.sentTo) toast(`Invitation sent again to ${r.sentTo}. The old code no longer works.`);
+    await familyTab();
+    showCode(b.dataset.label, r);
+  })));
   el.querySelectorAll("[data-rm-helper]").forEach((b) => (b.onclick = act(async () => {
     if (!confirm(`Remove ${b.dataset.label} as a trusted helper?`)) return;
     const r = await api("DELETE", `/api/family/helpers/${b.dataset.rmHelper}`, undefined, { own: true });
@@ -473,6 +511,7 @@ async function familyTab() {
     const code = $("#invitein").value.trim();
     if (!code) return toast("Paste the invitation code first.");
     const r = await api("POST", "/api/family/accept", { code }, { own: true });
+    pendingInvite = null;
     toast(`You're now a trusted helper${r.label ? ` (as ${r.label})` : ""}. Find the account under Accounts you help.`); await again();
   });
 }
