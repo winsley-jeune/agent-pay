@@ -107,7 +107,7 @@ function renderLogin() {
 }
 
 // ------------------------------------------------------------------ shell
-const tabs = [["all", "All subscriptions"], ["wallet", "Wallet"], ["approvals", "Approvals"], ["subscriptions", "Agent plans"], ["agents", "Agent keys"], ["security", "Passkeys"], ["provider", "Sell tools"]];
+const tabs = [["all", "All subscriptions"], ["watch", "Price watch"], ["wallet", "Wallet"], ["approvals", "Approvals"], ["subscriptions", "Agent plans"], ["agents", "Agent keys"], ["security", "Passkeys"], ["provider", "Sell tools"]];
 
 async function boot() {
   if (!token) return renderLogin();
@@ -142,7 +142,7 @@ function show(name) {
   tab = tabs.some(([k]) => k === name) ? name : "all";
   document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.tab === tab));
   document.querySelectorAll("main section").forEach((s) => s.classList.toggle("active", s.id === "tab-" + tab));
-  ({ all, wallet, approvals, subscriptions, agents, security, provider })[tab]().catch((e) => toast(e.message));
+  ({ all, watch, wallet, approvals, subscriptions, agents, security, provider })[tab]().catch((e) => toast(e.message));
 }
 
 // ------------------------------------------------------------------ all subscriptions
@@ -270,6 +270,61 @@ async function all() {
     });
     $("#del-" + id).onclick = act(async () => { await api("DELETE", `/api/everyday/${id}`); toast("Removed."); all(); });
   })));
+}
+
+// ------------------------------------------------------------------ price watch
+async function watch() {
+  const el = $("#tab-watch");
+  const { watches, saleEvents } = await api("GET", "/api/price-watch?all=1");
+  const live = watches.filter((w) => w.status === "watching" || w.status === "target_hit");
+  const ended = watches.filter((w) => w.status === "bought" || w.status === "stopped");
+  const chip = { watching: ["watching", ""], target_hit: ["target reached", "ok"], bought: ["bought", "ok"], stopped: ["stopped", "bad"] };
+  el.innerHTML = `
+    <div class="card"><h3>Upcoming sales</h3><div class="row">${saleEvents.map((e) => `<span class="chip">${esc(e.name)}: ${e.date ? `${esc(e.date)} (${e.daysAway} days)` : esc(e.window)}</span>`).join("")}</div></div>
+    ${live.map((w) => `<div class="card">
+      <div class="spread"><div><h3><a href="${esc(w.url)}" target="_blank" rel="noopener">${esc(w.title)}</a> <span class="chip ${chip[w.status][1]}">${chip[w.status][0]}</span></h3>
+        <div class="small muted">${esc(w.retailer)}${w.productKey ? " · " + esc(w.productKey) : ""}${w.expiresOn ? " · until " + esc(w.expiresOn) : ""}</div></div>
+        <div class="row">
+          <div><div class="small muted">Now</div><b>${w.currentPriceCents ? usd(w.currentPriceCents) : "?"}</b></div>
+          <div><div class="small muted">Lowest</div><b>${w.lowestSeenCents ? usd(w.lowestSeenCents) : "?"}</b></div>
+          <div><div class="small muted">Target</div><b>${usd(w.targetPriceCents)}</b></div>
+        </div></div>
+      ${w.advice.map((a) => `<div class="suggestion">${esc(a)}</div>`).join("")}
+      ${w.alerts.slice(0, 3).map((a) => `<div class="small" style="color:${a.type === "price_up" ? "var(--muted)" : "var(--ok)"}">${date(a.createdAt)} · ${esc(a.message)}</div>`).join("")}
+      <details style="margin-top:6px"><summary class="small muted">Price history (${w.history.length})</summary><table>
+        ${w.history.map((p) => `<tr><td class="small">${date(p.observedAt)}</td><td class="num">${usd(p.priceCents)}</td><td class="small muted">${esc(p.source)}${p.note ? " · " + esc(p.note) : ""}</td></tr>`).join("")}</table></details>
+      <div class="row" style="margin-top:8px">
+        <input type="number" step="0.01" min="0.01" placeholder="Price you see ($)" data-price-input="${w.id}" style="width:150px"><button data-price="${w.id}">Record price</button>
+        <input type="number" step="0.01" min="0.01" placeholder="New target ($)" data-target-input="${w.id}" style="width:140px"><button data-target="${w.id}">Change target</button>
+        <button class="primary" data-bought="${w.id}">I bought it</button><button class="danger" data-stop="${w.id}">Stop</button>
+      </div></div>`).join("") || `<div class="card muted">Not watching anything yet.</div>`}
+    <div class="card"><h3>Watch an item</h3>
+      <p class="small muted">Paste a product link and the price you want to pay. Your agent checks the price in your own browser and records it; AgentPay never signs in to the store or buys for you.</p>
+      <div class="grid" id="newwatch">
+        <label>Product link<input name="url" placeholder="https://www.amazon.com/dp/..."></label>
+        <label>Name<input name="title" placeholder="e.g. Sony headphones"></label>
+        <label>Price now ($)<input name="current" type="number" step="0.01" min="0.01"></label>
+        <label>Target price ($)<input name="target" type="number" step="0.01" min="0.01"></label>
+        <label>Stop watching after<input name="until" type="date"></label>
+      </div><div class="row" style="margin-top:8px"><button class="primary" id="addwatch">Watch</button></div>
+    </div>
+    ${ended.length ? `<div class="card"><h3>Done</h3><table>${ended.map((w) => `<tr><td>${esc(w.title)}</td><td><span class="chip ${chip[w.status][1]}">${chip[w.status][0]}</span></td>
+      <td class="num">${w.boughtPriceCents ? usd(w.boughtPriceCents) : ""}</td></tr>`).join("")}</table></div>` : ""}`;
+  $("#addwatch").onclick = act(async () => {
+    const f = (n) => $(`#newwatch [name=${n}]`).value.trim();
+    const r = await api("POST", "/api/price-watch", { url: f("url"), title: f("title") || undefined, targetPriceCents: toCents(f("target")),
+      currentPriceCents: toCents(f("current")) ?? undefined, expiresOn: f("until") || undefined });
+    toast(r.alerts?.[0]?.message ?? "Watching."); watch();
+  });
+  el.querySelectorAll("[data-price]").forEach((b) => (b.onclick = act(async () => {
+    const r = await api("POST", `/api/price-watch/${b.dataset.price}/prices`, { priceCents: toCents($(`[data-price-input="${b.dataset.price}"]`).value) });
+    toast(r.alerts[0]?.message ?? "Price recorded."); watch();
+  })));
+  el.querySelectorAll("[data-target]").forEach((b) => (b.onclick = act(async () => {
+    await api("PATCH", `/api/price-watch/${b.dataset.target}`, { targetPriceCents: toCents($(`[data-target-input="${b.dataset.target}"]`).value) }); watch();
+  })));
+  el.querySelectorAll("[data-bought]").forEach((b) => (b.onclick = act(async () => { await api("POST", `/api/price-watch/${b.dataset.bought}/bought`, {}); toast("Nice. Marked as bought."); watch(); })));
+  el.querySelectorAll("[data-stop]").forEach((b) => (b.onclick = act(async () => { await api("POST", `/api/price-watch/${b.dataset.stop}/stop`, {}); watch(); })));
 }
 
 // ------------------------------------------------------------------ wallet

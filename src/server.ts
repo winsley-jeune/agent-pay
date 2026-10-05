@@ -20,6 +20,8 @@ import { AppError } from "./errors.js";
 import { bearer, h, parse } from "./http.js";
 import { externalRoutes } from "./external-routes.js";
 import { rollRenewalDates } from "./external.js";
+import { expireWatches, refreshFromKeepa } from "./pricewatch.js";
+import { priceWatchRoutes } from "./pricewatch-routes.js";
 import { callPaidTool, getToolForAgent, spendSummary, sweepExpiredHolds } from "./gateway.js";
 import { balance, history } from "./ledger.js";
 import { migrate } from "./migrate.js";
@@ -444,6 +446,8 @@ export function createApp(db: Db) {
 
   app.use("/api/everyday", ownerOnly, externalRoutes(db, "owner"));
   app.use("/api/agent/everyday", agentOnly, externalRoutes(db, "agent"));
+  app.use("/api/price-watch", ownerOnly, priceWatchRoutes(db, "owner"));
+  app.use("/api/agent/price-watch", agentOnly, priceWatchRoutes(db, "agent"));
 
   // ------------------------------------------------------------ demo provider + dashboard
 
@@ -480,6 +484,8 @@ export function startJobs(db: Db) {
   const run = async () => {
     try {
       await rollRenewalDates(db);
+      await expireWatches(db);
+      if (config.keepaApiKey) await refreshFromKeepa(db, config.keepaApiKey);
       const released = await sweepExpiredHolds(db);
       if (released) console.log(`released ${released} expired hold(s)`);
       for (const o of await renewDueSubscriptions(db)) console.log(`subscription ${o.subscriptionId}: ${o.outcome}${o.reason ? ` (${o.reason})` : ""}`);

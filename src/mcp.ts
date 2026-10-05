@@ -337,4 +337,73 @@ server.registerTool(
   ({ subscription_id, confirmation }) => reply(api("POST", ext(`/${encodeURIComponent(subscription_id)}/mark-canceled`), { confirmation })),
 );
 
+// ---------------------------------------------------------------- price watch
+
+const pw = (path = "") => `/api/agent/price-watch${path}`;
+
+server.registerTool(
+  "watch_price",
+  {
+    title: "Watch an item for a price drop",
+    description:
+      "Track a product (e.g. an Amazon link) until it reaches the owner's target price. Include the current price if you know it. " +
+      "The result lists upcoming sales (Black Friday dates; Prime events as typical windows) to help decide whether to wait.",
+    inputSchema: {
+      url: z.string().describe("Product link"),
+      target_price_cents: z.number().int().positive().describe("Owner's target price"),
+      title: z.string().optional(),
+      current_price_cents: z.number().int().positive().optional(),
+      expires_on: day.optional().describe("Stop watching after this date"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ url, target_price_cents, title, current_price_cents, expires_on }) =>
+    reply(api("POST", pw(), { url, targetPriceCents: target_price_cents, title, currentPriceCents: current_price_cents, expiresOn: expires_on })),
+);
+
+server.registerTool(
+  "list_price_watches",
+  {
+    title: "Items being watched",
+    description: "Watched items with current, lowest and target price, recent history, alerts and timing advice.",
+    annotations: { readOnlyHint: true },
+  },
+  () => reply(api("GET", pw())),
+);
+
+server.registerTool(
+  "record_price",
+  {
+    title: "Report a price you saw",
+    description:
+      "Record the price you just saw on the product page (read it in the owner's own browser or from a search result; " +
+      "never try to get around a store's bot protection). Returns alerts such as target reached or new low. " +
+      "Use the price the owner would actually pay, and put coupons or deal names in note.",
+    inputSchema: { watch_id: z.string(), price_cents: z.number().int().positive(), note: z.string().max(200).optional() },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ watch_id, price_cents, note }) => reply(api("POST", pw(`/${encodeURIComponent(watch_id)}/prices`), { priceCents: price_cents, note })),
+);
+
+server.registerTool(
+  "mark_bought",
+  {
+    title: "Record that the owner bought it",
+    description: "Stop watching because the owner bought the item. Never buy it yourself; the owner decides and checks out.",
+    inputSchema: { watch_id: z.string(), price_cents: z.number().int().positive().optional() },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  ({ watch_id, price_cents }) => reply(api("POST", pw(`/${encodeURIComponent(watch_id)}/bought`), { priceCents: price_cents })),
+);
+
+server.registerTool(
+  "stop_watch",
+  {
+    title: "Stop watching an item",
+    inputSchema: { watch_id: z.string() },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  ({ watch_id }) => reply(api("POST", pw(`/${encodeURIComponent(watch_id)}/stop`), {})),
+);
+
 await server.connect(new StdioServerTransport());

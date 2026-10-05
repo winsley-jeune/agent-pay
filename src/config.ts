@@ -26,5 +26,7 @@ export const config = {
   platformFeeBps: Number(process.env.PLATFORM_FEE_BPS ?? 1000),
   allowDevCredit: process.env.ALLOW_DEV_CREDIT === "true",
   holdTtlSeconds: Number(process.env.HOLD_TTL_SECONDS ?? 300),
+  // Optional: automatic Amazon prices for price watches (https://keepa.com/#!api).
+  keepaApiKey: process.env.KEEPA_API_KEY ?? "",
   upstreamTimeoutMs: Number(process.env.UPSTREAM_TIMEOUT_MS ?? 30_000),
 };

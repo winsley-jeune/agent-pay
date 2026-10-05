@@ -5,6 +5,7 @@ import { syncCatalog } from "./catalog.js";
 import { createPool } from "./db.js";
 import { addExternal } from "./external.js";
 import { migrate } from "./migrate.js";
+import { addWatch, recordPrice } from "./pricewatch.js";
 import { devCredit } from "./wallet.js";
 
 // Demo owner "Maria" with typical everyday subscriptions, and a sample bank
@@ -25,8 +26,26 @@ await migrate(db);
 await syncCatalog(db);
 
 const email = "maria@agentpay.local";
-if ((await db.query("SELECT 1 FROM users WHERE email = $1", [email])).rowCount) {
-  console.log("Maria already exists. To start over: npm run db:down -- -v && npm run db:up && npm run seed && npm run seed:maria");
+
+/** Maria is waiting for a sale on headphones; prices from the last few weeks, as her agent saw them. */
+async function seedPriceWatch(userId: string) {
+  if ((await db.query("SELECT 1 FROM price_watches WHERE user_id = $1", [userId])).rowCount) return;
+  const { watch } = await addWatch(db, userId, {
+    url: "https://www.amazon.com/Sony-WH-1000XM5-Canceling-Headphones-Hands-Free/dp/B09XS7JWHH/ref=sr_1_1?tag=example-20",
+    title: "Sony WH-1000XM5 headphones",
+    targetPriceCents: 27_900,
+    notes: "For her birthday in December",
+  });
+  const seen: [number, number, string?][] = [[-21, 39_999], [-14, 34_800, "Limited time deal"], [-7, 39_999], [-1, 32_999]];
+  for (const [d, price, note] of seen) {
+    await recordPrice(db, userId, watch.id, { priceCents: price, source: "agent", note, observedAt: new Date(Date.now() + d * 86_400_000).toISOString() });
+  }
+}
+
+const existing = await db.query("SELECT id FROM users WHERE email = $1", [email]);
+if (existing.rowCount) {
+  await seedPriceWatch(existing.rows[0].id);
+  console.log("Maria already exists (added her price watch if missing). To start over: npm run db:down -- -v && npm run db:up && npm run seed && npm run seed:maria");
   await db.end();
   process.exit(0);
 }
@@ -53,6 +72,7 @@ await addExternal(db, user.id, {
   lastUsedOn: day(-3), notes: "Annual fee $49 charged in February",
 }, m);
 await addExternal(db, user.id, { serviceSlug: "spotify", priceCents: 1199, nextRenewalOn: day(24), paymentMethod: "Visa ending 4417", lastUsedOn: day(0) }, m);
+await seedPriceWatch(user.id);
 
 // A statement with the charges above, a Netflix price rise, and two subscriptions Maria forgot about.
 const lines = [["Date", "Description", "Amount"]];
