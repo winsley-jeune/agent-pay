@@ -67,7 +67,7 @@ const date = (d) => (d ? new Date(d).toLocaleString() : "");
 let token = null;
 try { token = localStorage.getItem("agentpay.token"); } catch {}
 let me = null;
-let tab = location.hash.slice(1) || "wallet";
+let tab = location.hash.slice(1) || "all";
 
 function toast(msg) {
   const t = $("#toast"); t.textContent = msg; t.style.display = "block";
@@ -107,7 +107,7 @@ function renderLogin() {
 }
 
 // ------------------------------------------------------------------ shell
-const tabs = [["wallet", "Wallet"], ["approvals", "Approvals"], ["subscriptions", "Subscriptions"], ["agents", "Agent keys"], ["security", "Passkeys"], ["provider", "Sell tools"]];
+const tabs = [["all", "All subscriptions"], ["wallet", "Wallet"], ["approvals", "Approvals"], ["subscriptions", "Agent plans"], ["agents", "Agent keys"], ["security", "Passkeys"], ["provider", "Sell tools"]];
 
 async function boot() {
   if (!token) return renderLogin();
@@ -127,7 +127,7 @@ async function boot() {
   setInterval(refreshCounts, 15000);
 }
 
-window.addEventListener("hashchange", () => token && me && show(location.hash.slice(1) || "wallet"));
+window.addEventListener("hashchange", () => token && me && show(location.hash.slice(1) || "all"));
 
 async function refreshCounts() {
   try {
@@ -139,10 +139,137 @@ async function refreshCounts() {
 }
 
 function show(name) {
-  tab = tabs.some(([k]) => k === name) ? name : "wallet";
+  tab = tabs.some(([k]) => k === name) ? name : "all";
   document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.tab === tab));
   document.querySelectorAll("main section").forEach((s) => s.classList.toggle("active", s.id === "tab-" + tab));
-  ({ wallet, approvals, subscriptions, agents, security, provider })[tab]().catch((e) => toast(e.message));
+  ({ all, wallet, approvals, subscriptions, agents, security, provider })[tab]().catch((e) => toast(e.message));
+}
+
+// ------------------------------------------------------------------ all subscriptions
+let catalog = null;
+const billedLabel = { direct: "Card", apple: "Apple", google: "Google Play", amazon: "Amazon", carrier: "Phone bill", other: "Other", agentpay: "AgentPay wallet" };
+const statusLabel = { active: ["active", "ok"], trial: ["free trial", "warn"], cancel_requested: ["cancel requested", "warn"], cancel_approved: ["cancel approved", "warn"],
+  canceling: ["cancels at period end", "warn"], past_due: ["past due", "bad"], pending_approval: ["waiting for approval", "warn"], canceled: ["cancelled", "bad"] };
+
+async function all() {
+  const el = $("#tab-all");
+  catalog ??= await api("GET", "/api/everyday/catalog");
+  const [data, { suggestions }] = await Promise.all([api("GET", "/api/everyday"), api("GET", "/api/everyday/suggestions")]);
+  const cats = Object.entries(data.totals.byCategory).sort((a, b) => b[1] - a[1]);
+  el.innerHTML = `
+    <div class="card spread">
+      <div><div class="muted small">All subscriptions, per month</div><div class="big">${usd(data.totals.monthlyCents)}</div>
+        <div class="small muted">${usd(data.totals.yearlyCents)} a year · ${data.items.filter((i) => i.status !== "trial").length} paid · ${data.items.filter((i) => i.status === "trial").length} in free trial</div></div>
+      <div class="row" style="max-width:520px">${cats.map(([c, v]) => `<span class="chip">${esc(c)} ${usd(v)}</span>`).join("")}</div>
+    </div>
+    ${data.reminders.length ? `<div class="card"><h3>Coming up</h3>${data.reminders.map((r) => `<div class="suggestion" style="border-color:var(--warn)">${esc(r.message)}</div>`).join("")}</div>` : ""}
+    ${suggestions.length ? `<div class="card"><h3>Ways to save</h3>${suggestions.map((s) => `<div class="suggestion">${esc(s.message)}
+      ${s.monthlySavingsCents ? `<span class="chip ok">save ${s.approximate ? "about " : ""}${usd(s.monthlySavingsCents)}/mo</span>` : ""}</div>`).join("")}
+      <p class="small muted">Catalog prices are approximate (as of ${esc(catalog.pricesAsOf)}); check the provider's site before switching.</p></div>` : ""}
+    <div class="card"><h3>Everything you pay for</h3><div class="table-wrap"><table>
+      <tr><th>Subscription</th><th>Paid through</th><th class="num">Price</th><th>Next charge</th><th>Status</th><th></th></tr>
+      ${data.items.map((i) => {
+        const [label, cls] = statusLabel[i.status] ?? [i.status, ""];
+        return `<tr>
+        <td><b>${esc(i.name)}</b>${i.contract ? ` <span class="chip warn" title="Cancelling may cost money or need notice">contract</span>` : ""}<div class="small muted">${esc(i.category)}${i.provider ? " · " + esc(i.provider) : ""}</div></td>
+        <td class="small">${esc(billedLabel[i.billedThrough] ?? i.billedThrough)}${i.paymentMethod && i.kind === "external" ? `<div class="muted">${esc(i.paymentMethod)}</div>` : ""}</td>
+        <td class="num">${usd(i.priceCents)}/${i.interval}${i.interval !== "month" ? `<div class="small muted">≈ ${usd(i.monthlyCents)}/mo</div>` : ""}</td>
+        <td class="small">${esc(i.nextRenewalOn ?? "")}</td>
+        <td><span class="chip ${cls}">${esc(label)}</span></td>
+        <td class="row">${i.kind === "agentpay" ? `<a href="#subscriptions" class="small">manage</a>` : `
+          <button data-guide="${i.id}">How to cancel</button>
+          ${i.status !== "canceled" ? `<button data-done="${i.id}">Mark cancelled</button>` : ""}
+          <button data-edit="${i.id}">Edit</button>`}</td></tr>
+        <tr id="detail-${i.id}" style="display:none"><td colspan="6"></td></tr>`;
+      }).join("") || `<tr><td colspan="6" class="muted">Nothing tracked yet. Add your subscriptions below or import a bank statement.</td></tr>`}
+    </table></div></div>
+    <div class="card"><h3>Add a subscription</h3>
+      <div class="grid" id="addext">
+        <label>Service<select name="service"><option value="">Other (type a name)</option>${catalog.services.map((s) => `<option value="${esc(s.slug)}">${esc(s.name)}</option>`).join("")}</select></label>
+        <label>Name (if other)<input name="name"></label>
+        <label>Price you pay ($)<input name="price" type="number" step="0.01" min="0"></label>
+        <label>Every<select name="interval"><option>month</option><option>year</option><option>week</option></select></label>
+        <label>Paid through<select name="billed">${Object.entries(billedLabel).filter(([k]) => k !== "agentpay").map(([k, v]) => `<option value="${k}">${v}</option>`).join("")}</select></label>
+        <label>Next charge<input name="next" type="date"></label>
+        <label>Free trial ends<input name="trial" type="date"></label>
+        <label>Contract until<input name="contract" type="date"></label>
+        <label>Early termination fee ($)<input name="etf" type="number" step="0.01" min="0"></label>
+        <label>Card / account<input name="pm" placeholder="Visa ending 4242"></label>
+      </div>
+      <p class="small muted">Subscribed on an iPhone, Android phone or Amazon? Choose Apple, Google Play or Amazon under "Paid through": that's where you cancel it.</p>
+      <div class="row"><button class="primary" id="addextbtn">Add</button></div>
+    </div>
+    <div class="card"><h3>Find subscriptions in a bank statement</h3>
+      <p class="small muted">Download a CSV of the last few months from your bank or card website and pick it here. It stays on this AgentPay server and is only used to find recurring charges.</p>
+      <div class="row"><input type="file" id="csv" accept=".csv,text/csv"><button id="importbtn">Import</button></div>
+      <div id="importres"></div>
+    </div>`;
+
+  $("#addext [name=service]").onchange = (e) => {
+    const s = catalog.services.find((x) => x.slug === e.target.value);
+    const tier = s?.tiers?.find((t) => !t.ads) ?? s?.tiers?.[0];
+    if (tier && !$("#addext [name=price]").value) $("#addext [name=price]").value = (tier.priceCents / 100).toFixed(2);
+    if (s?.category === "phone") $("#addext [name=billed]").value = "carrier";
+  };
+  $("#addextbtn").onclick = act(async () => {
+    const f = (n) => $(`#addext [name=${n}]`).value.trim();
+    const trial = f("trial");
+    await api("POST", "/api/everyday", {
+      serviceSlug: f("service") || undefined, name: f("name") || undefined, priceCents: toCents(f("price")) ?? 0, interval: f("interval"),
+      billedThrough: f("billed"), nextRenewalOn: f("next") || undefined, trialEndsOn: trial || undefined, status: trial ? "trial" : "active",
+      contractUntil: f("contract") || undefined, earlyTerminationFeeCents: toCents(f("etf")) ?? undefined, paymentMethod: f("pm") || undefined,
+    });
+    toast("Added."); all();
+  });
+  $("#importbtn").onclick = act(async () => {
+    const file = $("#csv").files[0];
+    if (!file) return toast("Choose a CSV file first.");
+    const r = await api("POST", "/api/everyday/import", { csv: await file.text() });
+    $("#importres").innerHTML = `
+      <p class="small">${r.imported} new transactions read${r.skippedDuplicates ? `, ${r.skippedDuplicates} already imported` : ""}.</p>
+      ${r.alerts.map((a) => `<div class="suggestion" style="border-color:var(--bad)">${esc(a.message)}</div>`).join("")}
+      ${r.proposals.length ? `<p><b>Looks like subscriptions you're not tracking yet:</b></p><table>${r.proposals.map((p, n) => `<tr>
+        <td><b>${esc(p.name)}</b><div class="small muted">${p.charges} charge${p.charges > 1 ? "s" : ""}, last ${esc(p.lastChargedOn)} · ${p.confidence} confidence${p.note ? "<br>" + esc(p.note) : ""}</div></td>
+        <td class="num">${usd(p.priceCents)}/${p.interval}</td><td><button data-propose="${n}">Add</button></td></tr>`).join("")}</table>` : `<p class="small muted">No new recurring charges found.</p>`}`;
+    $("#importres").querySelectorAll("[data-propose]").forEach((b) => (b.onclick = act(async () => {
+      const p = r.proposals[Number(b.dataset.propose)];
+      await api("POST", "/api/everyday", { serviceSlug: p.serviceSlug ?? undefined, name: p.serviceSlug ? undefined : p.name, category: p.category,
+        priceCents: p.priceCents, interval: p.interval, billedThrough: p.billedThrough, nextRenewalOn: p.nextRenewalOn });
+      b.replaceWith(Object.assign(document.createElement("span"), { className: "chip ok", textContent: "added" }));
+    })));
+  });
+
+  const detail = (id, html) => { const row = $("#detail-" + id); row.style.display = row.style.display === "none" || html ? "" : "none"; row.firstElementChild.innerHTML = html; };
+  el.querySelectorAll("[data-guide]").forEach((b) => (b.onclick = act(async () => {
+    const g = await api("GET", `/api/everyday/${b.dataset.guide}/cancel-guide`);
+    detail(b.dataset.guide, `<div class="small"><b>Cancel in: ${esc(g.where)}</b>${g.url ? ` · <a href="${esc(g.url)}" target="_blank" rel="noopener">open</a>` : ""}
+      <ol>${g.steps.map((s) => `<li>${esc(s)}</li>`).join("")}</ol>
+      ${g.warnings.map((w) => `<div style="color:var(--warn)">⚠ ${esc(w)}</div>`).join("")}</div>`);
+  })));
+  el.querySelectorAll("[data-done]").forEach((b) => (b.onclick = act(async () => {
+    detail(b.dataset.done, `<div class="row"><input id="conf-${b.dataset.done}" placeholder="Confirmation number (optional)"><button class="primary" id="confbtn-${b.dataset.done}">Mark cancelled</button></div>`);
+    $("#confbtn-" + b.dataset.done).onclick = act(async () => {
+      await api("POST", `/api/everyday/${b.dataset.done}/mark-canceled`, { confirmation: $("#conf-" + b.dataset.done).value || undefined });
+      toast("Marked cancelled. If a charge still shows up, importing your statement will flag it."); all();
+    });
+  })));
+  el.querySelectorAll("[data-edit]").forEach((b) => (b.onclick = act(async () => {
+    const { subscription: s } = await api("GET", `/api/everyday/${b.dataset.edit}`);
+    const id = s.id;
+    detail(id, `<div class="grid" id="edit-${id}">
+      <label>Price ($)<input name="price" type="number" step="0.01" value="${fromCents(s.priceCents)}"></label>
+      <label>Next charge<input name="next" type="date" value="${esc(s.nextRenewalOn ?? "")}"></label>
+      <label>Last used<input name="used" type="date" value="${esc(s.lastUsedOn ?? "")}"></label>
+      <label>Contract until<input name="contract" type="date" value="${esc(s.contractUntil ?? "")}"></label>
+      <label>Paid through<select name="billed">${Object.entries(billedLabel).filter(([k]) => k !== "agentpay").map(([k, v]) => `<option value="${k}" ${k === s.billedThrough ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+      </div><div class="row" style="margin-top:8px"><button class="primary" id="save-${id}">Save</button><button class="danger" id="del-${id}">Stop tracking</button></div>`);
+    const f = (n) => $(`#edit-${id} [name=${n}]`).value;
+    $("#save-" + id).onclick = act(async () => {
+      await api("PATCH", `/api/everyday/${id}`, { priceCents: toCents(f("price")) ?? 0, nextRenewalOn: f("next") || null, lastUsedOn: f("used") || null, contractUntil: f("contract") || null, billedThrough: f("billed") });
+      toast("Saved."); all();
+    });
+    $("#del-" + id).onclick = act(async () => { await api("DELETE", `/api/everyday/${id}`); toast("Removed."); all(); });
+  })));
 }
 
 // ------------------------------------------------------------------ wallet

@@ -61,6 +61,31 @@ Every call has an idempotency key, so a retry returns the stored result and is n
   - underused plans where paying per call would cost less
   - tools where a plan would cost less than current pay-per-call spending
 
+## Everyday subscriptions (Netflix, phone, gym...)
+
+The **All subscriptions** tab, and the `list_all_subscriptions` MCP tool, put everything in one list: everyday subscriptions billed by the merchant plus AgentPay plans, with a monthly total by category. AgentPay does not pay these merchants; it tracks them, reminds you, helps you cancel, and finds savings.
+
+- **Adding.** Add by hand, by an agent, or from a bank or card CSV export. The import finds recurring charges (weekly, monthly, yearly), ignores one-off and varying purchases like groceries or fuel, and links charges to known services.
+  - Apple, Google and Amazon combine several subscriptions into one statement line, so you add each one yourself.
+  - Importing the same file twice adds nothing new.
+- **Alerts.** Price increases from the statement, and charges that keep coming after you cancelled.
+- **Reminders.** Before renewals (3 days, or 14 for yearly plans), before a free trial ends, and before a contract ends.
+- **Cancelling.** The steps depend on who bills it: Paramount+ bought on an iPhone is cancelled in Apple settings, not on Paramount's site.
+  - Phone carriers, gyms and Adobe warn about contracts, device balances and fees, and that blocking the card or not paying isn't cancelling.
+  - An agent must `request_cancel` first. You approve it (with your passkey), and only then can the agent record it as cancelled.
+- **Savings ideas.**
+  - bundles (Disney+ and Hulu, Apple One)
+  - paying separately for something a bundle you have already includes
+  - cheaper ad-supported tiers
+  - yearly plans
+  - services you haven't used in 45 days
+  - rotating streaming services
+  - trials and contracts ending soon
+
+Catalog prices (`src/catalog.ts`) are approximate US list prices as of the date in that file, used only for comparisons. Update them as prices change; the price you enter for your own subscription is always what's used for your totals.
+
+Try it with the demo: `npm run seed:maria` creates Maria (Netflix, Apple TV+, Paramount+ billed through Apple, Disney+, a Hulu trial, AT&T with a device balance, Planet Fitness, Spotify) and `examples/maria-statement.csv`. Her credentials are in `.demo-credentials.json`.
+
 ## MCP tools
 
 | Tool | What it does |
@@ -72,7 +97,12 @@ Every call has an idempotency key, so a retry returns the stored result and is n
 | `check_approval` | Status of a pending approval |
 | `browse_plans` | Catalog plus personalised savings suggestions |
 | `subscribe` / `renew_subscription` | Request a subscription or renewal (owner approves with a passkey) |
-| `list_subscriptions` / `cancel_subscription` | Manage subscriptions |
+| `list_subscriptions` / `cancel_subscription` | Manage AgentPay plans |
+| `list_all_subscriptions` | Everything in one list, with totals and reminders |
+| `find_service` / `add_subscription` / `update_subscription` | Track everyday subscriptions |
+| `import_bank_statement` | Find subscriptions, price increases and charges after cancelling in a CSV |
+| `savings_ideas` | Bundles, cheaper tiers, unused services and more |
+| `cancel_guide` / `request_cancel` / `mark_canceled` | Cancel safely, with the owner's approval |
 
 ## Configuration
 

@@ -17,6 +17,9 @@ import { syncCatalog } from "./catalog.js";
 import { config } from "./config.js";
 import { createPool, type Db } from "./db.js";
 import { AppError } from "./errors.js";
+import { bearer, h, parse } from "./http.js";
+import { externalRoutes } from "./external-routes.js";
+import { rollRenewalDates } from "./external.js";
 import { callPaidTool, getToolForAgent, spendSummary, sweepExpiredHolds } from "./gateway.js";
 import { balance, history } from "./ledger.js";
 import { migrate } from "./migrate.js";
@@ -58,25 +61,6 @@ const limitsSchema = z.object({
   approvalThresholdCents: nullableCents,
   allowedToolSlugs: z.array(slug).nullable().optional(),
 });
-
-function parse<T extends z.ZodType>(schema: T, value: unknown): z.infer<T> {
-  const result = schema.safeParse(value ?? {});
-  if (!result.success) {
-    throw new AppError(400, "invalid_request", result.error.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; "));
-  }
-  return result.data;
-}
-
-function bearer(req: Request): string | null {
-  const h = req.header("authorization");
-  return h?.startsWith("Bearer ") ? h.slice(7).trim() : null;
-}
-
-/** Wrap async handlers so thrown errors reach the error middleware. */
-const h =
-  (fn: (req: Request, res: Response) => Promise<unknown>) =>
-  (req: Request, res: Response, next: NextFunction) =>
-    fn(req, res).then((body) => (res.headersSent ? undefined : res.json(body ?? { ok: true })), next);
 
 export function createApp(db: Db) {
   const app = express();
@@ -456,6 +440,11 @@ export function createApp(db: Db) {
     h(async (req) => requestResume(db, req.agentKey!.userId, String(req.params.id), req.agentKey!)),
   );
 
+  // ------------------------------------------------------------ everyday subscriptions (Netflix, phone, gym...)
+
+  app.use("/api/everyday", ownerOnly, externalRoutes(db, "owner"));
+  app.use("/api/agent/everyday", agentOnly, externalRoutes(db, "agent"));
+
   // ------------------------------------------------------------ demo provider + dashboard
 
   app.use("/sample", sampleRouter());
@@ -490,6 +479,7 @@ export function createApp(db: Db) {
 export function startJobs(db: Db) {
   const run = async () => {
     try {
+      await rollRenewalDates(db);
       const released = await sweepExpiredHolds(db);
       if (released) console.log(`released ${released} expired hold(s)`);
       for (const o of await renewDueSubscriptions(db)) console.log(`subscription ${o.subscriptionId}: ${o.outcome}${o.reason ? ` (${o.reason})` : ""}`);

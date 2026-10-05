@@ -180,7 +180,7 @@ export const SERVICES: Service[] = [
   {
     slug: "gym", name: "Gym membership", category: "fitness",
     cancelSteps: ["Read your membership agreement for the notice period and cancellation method", "Cancel in writing and keep proof"],
-    merchantPatterns: ["FITNESS", "GYM", "24 HOUR FIT", "LA FITNESS", "EQUINOX", "CRUNCH", "ANYTIME FIT"],
+    merchantPatterns: ["FITNESS", "GYM", "24 HOUR FIT", "LA FITNESS", "EQUINOX", "CRUNCH FIT", "ANYTIME FIT"],
     contractRisk: true,
     contractNote: "Gym contracts often require notice or written cancellation and may charge a cancellation fee.",
   },

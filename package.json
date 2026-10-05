@@ -10,7 +10,8 @@
     "start": "tsx src/server.ts",
     "mcp": "tsx src/mcp.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "seed:maria": "tsx src/seed-maria.ts"
   },
   "license": "UNLICENSED",
   "description": "Prepaid credit wallet and payment gateway that lets AI agents pay for tools and API calls",

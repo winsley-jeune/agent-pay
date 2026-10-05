@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -12,7 +13,7 @@ import { z } from "zod";
 const baseUrl = (process.env.AGENTPAY_URL ?? "http://localhost:8787").replace(/\/$/, "");
 const agentKey = process.env.AGENTPAY_AGENT_KEY ?? "";
 
-async function api(method: "GET" | "POST", path: string, body?: unknown) {
+async function api(method: "GET" | "POST" | "PATCH", path: string, body?: unknown) {
   if (!agentKey) throw new Error("AGENTPAY_AGENT_KEY is not set in this MCP server's environment");
   const res = await fetch(baseUrl + path, {
     method,
@@ -41,7 +42,10 @@ const server = new McpServer(
       "AgentPay lets you pay for tools and subscriptions from a prepaid wallet your owner controls. " +
       "Amounts are in US cents. Before an expensive call, use get_quote. Every call_paid_tool result says what was charged. " +
       "If a result says pending_approval, tell the user what needs approving and why; they approve with a passkey on their own device. " +
-      "Before subscribing, call browse_plans and prefer the suggestion that saves the most; never subscribe to two plans that cover the same need.",
+      "Before subscribing, call browse_plans and prefer the suggestion that saves the most; never subscribe to two plans that cover the same need. " +
+      "AgentPay also keeps the owner's everyday subscriptions (Netflix, Apple TV+, phone plan, gym...) in one list: use list_all_subscriptions, " +
+      "add_subscription, import_bank_statement and savings_ideas. Those are billed by the merchant, not AgentPay. " +
+      "Never cancel one without request_cancel first; the owner approves, then follow cancel_guide and record it with mark_canceled.",
   },
 );
 
@@ -160,6 +164,177 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: false },
   },
   ({ subscription_id }) => reply(api("POST", `/api/agent/subscriptions/${encodeURIComponent(subscription_id)}/renew`, {})),
+);
+
+// ---------------------------------------------------------------- everyday subscriptions
+
+const ext = (path = "") => `/api/agent/everyday${path}`;
+const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe("YYYY-MM-DD");
+const billedThrough = z.enum(["direct", "apple", "google", "amazon", "carrier", "other"]);
+const fail = (message: string) => reply(Promise.resolve({ ok: false, json: { error: { message } } }));
+
+server.registerTool(
+  "list_all_subscriptions",
+  {
+    title: "All subscriptions in one place",
+    description:
+      "Every subscription the owner has: everyday ones (streaming, phone, gym, software...) and AgentPay plans, with prices, " +
+      "renewal dates, monthly total by category, and upcoming reminders (renewals, trial ends, contract ends).",
+    annotations: { readOnlyHint: true },
+  },
+  () => reply(api("GET", ext())),
+);
+
+server.registerTool(
+  "find_service",
+  {
+    title: "Look up a known service",
+    description: "Known services: slug, category, cancel steps, approximate prices. Use the slug when adding a subscription.",
+    inputSchema: { query: z.string().optional().describe("e.g. 'netflix' or 'phone'") },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ query }) => {
+    const res = await api("GET", ext("/catalog"));
+    if (!res.ok || !query) return reply(Promise.resolve(res));
+    const q = query.toLowerCase();
+    const j = res.json as { services: { slug: string; name: string; category: string }[]; pricesAsOf: string; pricesNote: string };
+    const services = j.services.filter((s) => s.slug.includes(q) || s.name.toLowerCase().includes(q) || s.category.includes(q));
+    return reply(Promise.resolve({ ok: true, json: { pricesAsOf: j.pricesAsOf, pricesNote: j.pricesNote, services } }));
+  },
+);
+
+server.registerTool(
+  "add_subscription",
+  {
+    title: "Track an everyday subscription",
+    description:
+      "Add a subscription the owner pays outside AgentPay (Netflix, AT&T, gym...). Ask the owner for the real price. " +
+      "Set billed_through to apple, google or amazon if they subscribed through an app store, because that changes how to cancel.",
+    inputSchema: {
+      service: z.string().optional().describe("Slug from find_service, e.g. netflix, att-wireless"),
+      name: z.string().optional().describe("Needed when the service is not in the catalog"),
+      category: z.string().optional(),
+      plan_name: z.string().optional(),
+      price_cents: z.number().int().nonnegative(),
+      interval: z.enum(["week", "month", "year"]).default("month"),
+      billed_through: billedThrough.optional(),
+      payment_method: z.string().optional().describe("e.g. Visa ending 4242"),
+      status: z.enum(["active", "trial"]).optional(),
+      next_renewal_on: day.optional(),
+      trial_ends_on: day.optional(),
+      contract_until: day.optional(),
+      early_termination_fee_cents: z.number().int().nonnegative().optional(),
+      notes: z.string().optional(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  (a) =>
+    reply(
+      api("POST", ext(), {
+        serviceSlug: a.service, name: a.name, category: a.category, planName: a.plan_name, priceCents: a.price_cents, interval: a.interval,
+        billedThrough: a.billed_through, paymentMethod: a.payment_method, status: a.status, nextRenewalOn: a.next_renewal_on,
+        trialEndsOn: a.trial_ends_on, contractUntil: a.contract_until, earlyTerminationFeeCents: a.early_termination_fee_cents, notes: a.notes,
+      }),
+    ),
+);
+
+server.registerTool(
+  "update_subscription",
+  {
+    title: "Update an everyday subscription",
+    description: "Change price, renewal date or contract details, or record when the owner last used it (feeds the 'you never use this' suggestion).",
+    inputSchema: {
+      subscription_id: z.string(),
+      price_cents: z.number().int().nonnegative().optional(),
+      interval: z.enum(["week", "month", "year"]).optional(),
+      next_renewal_on: day.optional(),
+      contract_until: day.optional(),
+      early_termination_fee_cents: z.number().int().nonnegative().optional(),
+      last_used_on: day.optional(),
+      billed_through: billedThrough.optional(),
+      notes: z.string().optional(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  ({ subscription_id, ...a }) =>
+    reply(
+      api("PATCH", ext(`/${encodeURIComponent(subscription_id)}`), {
+        priceCents: a.price_cents, interval: a.interval, nextRenewalOn: a.next_renewal_on, contractUntil: a.contract_until,
+        earlyTerminationFeeCents: a.early_termination_fee_cents, lastUsedOn: a.last_used_on, billedThrough: a.billed_through, notes: a.notes,
+      }),
+    ),
+);
+
+server.registerTool(
+  "import_bank_statement",
+  {
+    title: "Find subscriptions in a bank statement",
+    description:
+      "Import a bank or card CSV export (date, description, amount columns). Returns recurring charges not tracked yet " +
+      "(confirm them with the owner, then add_subscription), price increases, and charges that kept coming after a cancellation.",
+    inputSchema: {
+      file_path: z.string().optional().describe("Path to a CSV file on this computer"),
+      csv: z.string().optional().describe("CSV text, if there is no file"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  async ({ file_path, csv }) => {
+    let text = csv;
+    if (file_path) {
+      try {
+        text = await readFile(file_path, "utf8");
+      } catch (err) {
+        return fail(`could not read ${file_path}: ${(err as Error).message}`);
+      }
+    }
+    if (!text) return fail("give file_path or csv");
+    return reply(api("POST", ext("/import"), { csv: text }));
+  },
+);
+
+server.registerTool(
+  "savings_ideas",
+  {
+    title: "Ways to save on everyday subscriptions",
+    description: "Bundles, paying twice for the same thing, cheaper ad tiers, yearly plans, unused services, too many streaming services, trials and contracts ending.",
+    annotations: { readOnlyHint: true },
+  },
+  () => reply(api("GET", ext("/suggestions"))),
+);
+
+server.registerTool(
+  "cancel_guide",
+  {
+    title: "How to cancel",
+    description:
+      "Where and how to cancel, which depends on who bills it (Paramount+ bought on an iPhone is cancelled in Apple settings), " +
+      "plus warnings about contracts, fees, and the date to cancel by.",
+    inputSchema: { subscription_id: z.string() },
+    annotations: { readOnlyHint: true },
+  },
+  ({ subscription_id }) => reply(api("GET", ext(`/${encodeURIComponent(subscription_id)}/cancel-guide`))),
+);
+
+server.registerTool(
+  "request_cancel",
+  {
+    title: "Ask the owner to approve cancelling",
+    description: "Start cancelling an everyday subscription. The owner approves first, with their passkey; then follow cancel_guide.",
+    inputSchema: { subscription_id: z.string(), reason: z.string().max(500) },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ subscription_id, reason }) => reply(api("POST", ext(`/${encodeURIComponent(subscription_id)}/request-cancel`), { reason })),
+);
+
+server.registerTool(
+  "mark_canceled",
+  {
+    title: "Record that it is cancelled",
+    description: "After it was actually cancelled with the provider (and the owner approved), record it with the confirmation number.",
+    inputSchema: { subscription_id: z.string(), confirmation: z.string().optional() },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  ({ subscription_id, confirmation }) => reply(api("POST", ext(`/${encodeURIComponent(subscription_id)}/mark-canceled`), { confirmation })),
 );
 
 await server.connect(new StdioServerTransport());

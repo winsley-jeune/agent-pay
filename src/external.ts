@@ -69,11 +69,19 @@ function checkDate(field: string, v: string | null | undefined) {
   if (v != null && (!isoDate.test(v) || Number.isNaN(Date.parse(v)))) throw new AppError(400, "invalid_date", `${field} must be YYYY-MM-DD`);
 }
 
+/** True if `pattern` occurs in `text` at the start of a word ("HULU" matches "HULU 877..." but not "SHULUX"). */
+function startsWord(text: string, pattern: string): boolean {
+  for (let i = text.indexOf(pattern); i >= 0; i = text.indexOf(pattern, i + 1)) {
+    if (i === 0 || !/[A-Z0-9]/.test(text[i - 1])) return true;
+  }
+  return false;
+}
+
 /** Merchant key used to link statement lines to subscriptions: a catalog slug when known. */
 export function merchantKeyFor(description: string): { key: string; serviceSlug: string | null; billedThrough: BilledThrough | null } {
   const d = description.toUpperCase();
   for (const s of SERVICES) {
-    if (s.merchantPatterns.some((p) => d.includes(p))) return { key: `service:${s.slug}`, serviceSlug: s.slug, billedThrough: s.category === "phone" ? "carrier" : null };
+    if (s.merchantPatterns.some((p) => startsWord(d, p))) return { key: `service:${s.slug}`, serviceSlug: s.slug, billedThrough: s.category === "phone" ? "carrier" : null };
   }
   for (const b of STORE_BILLERS) {
     if (d.includes(b.pattern)) return { key: `store:${b.billedThrough}`, serviceSlug: null, billedThrough: b.billedThrough };
@@ -506,7 +514,7 @@ export async function importStatement(db: Db, userId: string, lines: StatementLi
     const gaps = dates.slice(1).map((d, i) => daysBetween(dates[i], d));
     let interval = gaps.length ? intervalFromGap(median(gaps)) : null;
     // Recurring = regular gaps and similar amounts (a price change is fine; random purchases aren't).
-    const steady = amounts.every((a) => Math.abs(a - amounts.at(-1)!) <= Math.max(300, amounts.at(-1)! * 0.35));
+    const steady = isSteady(amounts, store !== undefined || service?.category === "phone");
     let confidence: Proposal["confidence"];
     if (interval && steady && dates.length >= 3) confidence = "high";
     else if (interval && steady) confidence = "medium";
@@ -539,10 +547,26 @@ export async function importStatement(db: Db, userId: string, lines: StatementLi
   return { imported: inserted, skippedDuplicates: lines.length - inserted, proposals, alerts };
 }
 
+/**
+ * Subscriptions charge the same amount each time, or step up once when the
+ * price changes. Groceries and fuel drift. Phone bills and app-store totals
+ * vary a little (taxes, add-ons), so they get more slack.
+ */
+function isSteady(amounts: number[], variableBill: boolean): boolean {
+  const last = amounts.at(-1)!;
+  const tolerance = variableBill ? 0.1 : 0.02;
+  if (amounts.every((a) => Math.abs(a - last) <= last * tolerance)) return true;
+  // One price change: a run of one amount followed by a run of another.
+  const change = amounts.findIndex((a) => a !== amounts[0]);
+  return change > 0 && amounts.slice(change).every((a) => a === amounts[change]);
+}
+
 function titleCase(s: string): string {
   return s
     .replace(/[#*]\S*/g, "")
-    .replace(/\d{3,}/g, "")
+    .split(/\s+/)
+    .filter((w) => !/\.(COM|NET|ORG)|\/|\d{3,}/i.test(w))
+    .join(" ")
     .trim()
     .toLowerCase()
     .replace(/\b\w/g, (c) => c.toUpperCase())
@@ -655,7 +679,10 @@ export async function externalSuggestions(db: Db, userId: string, today = new Da
     if (have.length >= 2) {
       const current = have.reduce((t, slug) => t + m(bySlug.get(slug)!), 0);
       const bundleMonthly = monthlyCents(b.priceCents, b.interval);
-      if (bundleMonthly < current) {
+      if (bundleMonthly < current && !out.some((o) => o.type === "bundle" && o.subscriptions.join() === have.map((s) => bySlug.get(s)!.id).join() && o.monthlySavingsCents >= current - bundleMonthly)) {
+        // Keep only the best bundle for the same set of subscriptions.
+        const same = out.findIndex((o) => o.type === "bundle" && o.subscriptions.join() === have.map((s) => bySlug.get(s)!.id).join());
+        if (same >= 0) out.splice(same, 1);
         out.push({
           type: "bundle", monthlySavingsCents: current - bundleMonthly, subscriptions: have.map((s) => bySlug.get(s)!.id), approximate: true,
           message: `You pay ${usd(current)}/month for ${have.map((s) => bySlug.get(s)!.name).join(" + ")}. ${b.name} is about ${usd(bundleMonthly)}/month${b.note ? ` (${b.note})` : ""}.`,
@@ -698,7 +725,8 @@ export async function externalSuggestions(db: Db, userId: string, today = new Da
 
   const streaming = subs.filter((s) => s.category === "streaming" && s.status === "active");
   if (streaming.length >= 3) {
-    const sorted = [...streaming].sort((a, b) => m(a) - m(b));
+    // Keep the two used most recently (or the cheapest if usage is unknown); rotate the rest.
+    const sorted = [...streaming].sort((a, b) => (a.lastUsedOn ?? "").localeCompare(b.lastUsedOn ?? "") || m(b) - m(a));
     const keep = sorted.slice(-2);
     const pause = sorted.slice(0, -2);
     const savings = pause.reduce((t, s) => t + m(s), 0);

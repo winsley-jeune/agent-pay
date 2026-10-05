@@ -67,6 +67,19 @@ describe("statement import", () => {
     expect(again.imported).toBe(0);
   });
 
+  it("does not mistake regular shopping with changing amounts for a subscription", async () => {
+    const { user } = await setup(db);
+    const csv = [
+      "Date,Description,Amount",
+      "2026-06-26,SHELL OIL 57444,-46.20", "2026-07-26,SHELL OIL 57444,-42.10", "2026-08-26,SHELL OIL 57444,-50.33",
+      "2026-06-02,NYTIMES DIGITAL SUB NYTIMES.COM,-25.00", "2026-07-02,NYTIMES DIGITAL SUB NYTIMES.COM,-25.00", "2026-08-02,NYTIMES DIGITAL SUB NYTIMES.COM,-25.00",
+      // A price change is still a subscription.
+      "2026-06-09,CRUNCHYROLL*MEMBER,-7.99", "2026-07-09,CRUNCHYROLL*MEMBER,-9.99", "2026-08-09,CRUNCHYROLL*MEMBER,-9.99",
+    ].join("\n");
+    const { proposals } = await importStatement(db, user.id, parseStatementCsv(csv));
+    expect(proposals.map((p) => p.name).sort()).toEqual(["Crunchyroll", "Nytimes Digital Sub"]);
+  });
+
   it("flags a price increase and charges after cancelling", async () => {
     const { user } = await setup(db);
     const netflix = await addExternal(db, user.id, { serviceSlug: "netflix", priceCents: 1549, interval: "month" }, manual);
@@ -199,6 +212,7 @@ describe("everyday savings ideas", () => {
     const types = s.map((x) => x.type);
     expect(s.find((x) => x.type === "already_in_bundle")?.message).toMatch(/Apple One Individual already includes Apple TV\+/);
     expect(s.find((x) => x.type === "bundle")?.message).toMatch(/Disney\+ \+ Hulu/);
+    expect(s.filter((x) => x.type === "bundle")).toHaveLength(1); // only the best bundle for the same pair
     expect(s.find((x) => x.type === "cheaper_tier" && x.message.startsWith("Netflix"))).toMatchObject({ monthlySavingsCents: 2499 - 799, approximate: true });
     expect(s.find((x) => x.type === "unused")?.message).toMatch(/Netflix since 2026-06-01/);
     expect(types).toContain("rotate_streaming");
