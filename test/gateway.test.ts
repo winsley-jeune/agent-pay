@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agentKeyById } from "../src/auth.js";
 import type { Db } from "../src/db.js";
-import { callPaidTool, decideApproval, sweepExpiredHolds } from "../src/gateway.js";
+import { approve } from "../src/approvals.js";
+import { callPaidTool, sweepExpiredHolds } from "../src/gateway.js";
 import { balance, systemAccount } from "../src/ledger.js";
 import { fakeFetch, freshDb, ledgerTotal, setup } from "./helpers.js";
 
@@ -155,7 +156,7 @@ describe("approvals", () => {
       code: "approval_invalid",
     });
 
-    await decideApproval(db, user.id, approvalId, true);
+    await approve(db, user.id, approvalId, undefined, { requirePasskey: false });
     const ok = await callPaidTool(db, agentKey, call(tool.slug, "a1", {}, approvalId), { fetchImpl: impl });
     expect(ok.status).toBe("ok");
 
@@ -169,7 +170,7 @@ describe("approvals", () => {
     const a = await setup(db, { credit: 1000, limits: { approvalThresholdCents: 50 } });
     const b = await setup(db);
     const pending = await callPaidTool(db, a.agentKey, call(a.tool.slug, "x"), { fetchImpl: fakeFetch().impl });
-    await expect(decideApproval(db, b.user.id, (pending as { approvalId: string }).approvalId, true)).rejects.toMatchObject({
+    await expect(approve(db, b.user.id, (pending as { approvalId: string }).approvalId, undefined, { requirePasskey: false })).rejects.toMatchObject({
       code: "not_found",
     });
   });

@@ -4,7 +4,9 @@ import type { Db, Tx } from "./db.js";
 import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
 import { balance, lockAccount, post, systemAccount } from "./ledger.js";
+import { createCallApproval } from "./approvals.js";
 import { quote, toolById, toolBySlug, type Tool } from "./registry.js";
+import { findCoverage } from "./subscriptions.js";
 
 export interface CallRequest {
   tool: string;
@@ -15,7 +17,16 @@ export interface CallRequest {
 }
 
 export type CallResult =
-  | { status: "ok"; callId: string; chargedCents: number; balanceCents: number; result: unknown; replayed: boolean }
+  | {
+      status: "ok";
+      callId: string;
+      chargedCents: number;
+      balanceCents: number;
+      result: unknown;
+      replayed: boolean;
+      /** Set when the call was free because a subscription included it. */
+      coveredBySubscription?: string;
+    }
   | { status: "failed"; callId: string; chargedCents: 0; balanceCents: number; error: string; replayed: boolean }
   | { status: "pending_approval"; approvalId: string; amountCents: number; approveUrl: string; message: string };
 
@@ -105,9 +116,24 @@ async function replay(db: Db, hold: HoldRow, toolId: string): Promise<CallResult
  * Reserve funds for one call. Takes the wallet lock so that balance and
  * budget checks cannot race with another call from the same wallet.
  */
-async function placeHold(db: Db, agentKey: AgentKey, tool: Tool, amountCents: number, req: CallRequest): Promise<HoldRow> {
+async function placeHold(
+  db: Db,
+  agentKey: AgentKey,
+  tool: Tool,
+  amountCents: number,
+  req: CallRequest,
+  subscriptionId: string | null = null,
+): Promise<HoldRow> {
   return withTx(db, async (tx) => {
     await lockAccount(tx, agentKey.walletAccountId);
+
+    if (subscriptionId) {
+      // Re-check quota under the wallet lock so parallel calls can't overspend it.
+      const coverage = await findCoverage(tx, agentKey.userId, tool);
+      if (coverage?.subscriptionId !== subscriptionId) {
+        throw new AppError(409, "quota_changed", "the subscription's included calls just ran out; retry to pay per call");
+      }
+    }
 
     if (agentKey.dailyCapCents !== null) {
       const spent = await spentSince(tx, agentKey.id, 1);
@@ -150,10 +176,10 @@ async function placeHold(db: Db, agentKey: AgentKey, tool: Tool, amountCents: nu
     }
 
     const { rows } = await tx.query(
-      `INSERT INTO holds (agent_key_id, wallet_account_id, tool_id, idempotency_key, amount_cents, expires_at)
-       VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))
+      `INSERT INTO holds (agent_key_id, wallet_account_id, tool_id, idempotency_key, amount_cents, expires_at, subscription_id)
+       VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7)
        RETURNING ${holdColumns}`,
-      [agentKey.id, agentKey.walletAccountId, tool.id, req.idempotencyKey, amountCents, config.holdTtlSeconds],
+      [agentKey.id, agentKey.walletAccountId, tool.id, req.idempotencyKey, amountCents, config.holdTtlSeconds, subscriptionId],
     );
     const hold: HoldRow = rows[0];
     if (amountCents > 0) {
@@ -272,45 +298,6 @@ async function callUpstream(tool: Tool, callId: string, input: unknown, fetchImp
   return { body, unitsUsed: unitsHeader !== null && /^\d+$/.test(unitsHeader) ? Number(unitsHeader) : null };
 }
 
-export async function createApproval(db: Db, agentKey: AgentKey, tool: Tool, amountCents: number, input: unknown) {
-  const { rows } = await db.query(
-    "INSERT INTO approvals (agent_key_id, tool_id, amount_cents, input) VALUES ($1, $2, $3, $4) RETURNING id",
-    [agentKey.id, tool.id, amountCents, JSON.stringify(input)],
-  );
-  return rows[0].id as string;
-}
-
-export async function listApprovals(db: Db, userId: string, status?: string) {
-  const { rows } = await db.query(
-    `SELECT ap.id, ap.status, ap.amount_cents AS "amountCents", ap.input, ap.created_at AS "createdAt",
-            ap.decided_at AS "decidedAt", t.slug AS tool, k.name AS "agentKeyName", k.id AS "agentKeyId"
-       FROM approvals ap JOIN agent_keys k ON k.id = ap.agent_key_id JOIN tools t ON t.id = ap.tool_id
-      WHERE k.user_id = $1 AND ($2::text IS NULL OR ap.status = $2)
-      ORDER BY ap.created_at DESC LIMIT 100`,
-    [userId, status ?? null],
-  );
-  return rows;
-}
-
-export async function decideApproval(db: Db, userId: string, approvalId: string, approve: boolean) {
-  const { rowCount } = await db.query(
-    `UPDATE approvals ap SET status = $3, decided_at = now()
-       FROM agent_keys k
-      WHERE ap.id = $1 AND k.id = ap.agent_key_id AND k.user_id = $2 AND ap.status = 'pending'`,
-    [approvalId, userId, approve ? "approved" : "denied"],
-  );
-  if (!rowCount) throw new AppError(404, "not_found", "no pending approval with that id");
-}
-
-export async function approvalStatus(db: Db, agentKey: AgentKey, approvalId: string) {
-  const { rows } = await db.query(
-    `SELECT id, status, amount_cents AS "amountCents" FROM approvals WHERE id = $1 AND agent_key_id = $2`,
-    [approvalId, agentKey.id],
-  );
-  if (!rows[0]) throw new AppError(404, "not_found", "approval not found");
-  return rows[0];
-}
-
 /**
  * The paid call: quote → budget checks → hold → upstream → capture or release.
  * Every path that places a hold settles it before returning.
@@ -324,17 +311,19 @@ export async function callPaidTool(db: Db, agentKey: AgentKey, req: CallRequest,
   const existing = await holdByKey(db, agentKey.id, req.idempotencyKey);
   if (existing) return replay(db, existing, tool.id);
 
-  const { amountCents } = quote(tool, req.input);
+  // A subscription with included calls left makes this call free; budgets and approvals don't apply.
+  const coverage = await findCoverage(db, agentKey.userId, tool);
+  const amountCents = coverage ? 0 : quote(tool, req.input).amountCents;
 
-  if (agentKey.perCallMaxCents !== null && amountCents > agentKey.perCallMaxCents) {
+  if (!coverage && agentKey.perCallMaxCents !== null && amountCents > agentKey.perCallMaxCents) {
     throw new AppError(402, "per_call_max_exceeded", "this call costs more than the agent's per-call limit", {
       amountCents,
       perCallMaxCents: agentKey.perCallMaxCents,
     });
   }
 
-  if (agentKey.approvalThresholdCents !== null && amountCents > agentKey.approvalThresholdCents && !req.approvalId) {
-    const approvalId = await createApproval(db, agentKey, tool, amountCents, req.input);
+  if (!coverage && agentKey.approvalThresholdCents !== null && amountCents > agentKey.approvalThresholdCents && !req.approvalId) {
+    const approvalId = await createCallApproval(db, agentKey, tool, amountCents, req.input);
     return {
       status: "pending_approval",
       approvalId,
@@ -342,13 +331,13 @@ export async function callPaidTool(db: Db, agentKey: AgentKey, req: CallRequest,
       approveUrl: `${config.publicUrl}/#approvals`,
       message:
         `This call costs ${amountCents}c, above the owner's approval threshold. ` +
-        `Ask the owner to approve it, then retry with the same input and approvalId "${approvalId}".`,
+        `Ask the owner to approve it with their passkey, then retry with the same input and approvalId "${approvalId}".`,
     };
   }
 
   let hold: HoldRow;
   try {
-    hold = await placeHold(db, agentKey, tool, amountCents, req);
+    hold = await placeHold(db, agentKey, tool, amountCents, { ...req, approvalId: coverage ? undefined : req.approvalId }, coverage?.subscriptionId ?? null);
   } catch (err: any) {
     // Lost a race with a concurrent call using the same idempotency key.
     if (err?.code === "23505") {
@@ -403,5 +392,6 @@ export async function callPaidTool(db: Db, agentKey: AgentKey, req: CallRequest,
     balanceCents: await balance(db, agentKey.walletAccountId),
     result: upstream.body,
     replayed: false,
+    ...(coverage ? { coveredBySubscription: coverage.subscriptionId } : {}),
   };
 }

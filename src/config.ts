@@ -10,10 +10,17 @@ try {
   // no .env file; rely on the real environment
 }
 
+const publicUrl = process.env.PUBLIC_URL ?? `http://localhost:${process.env.PORT ?? 8787}`;
+
 export const config = {
   databaseUrl: process.env.DATABASE_URL ?? "postgres://agentpay:agentpay@localhost:5433/agentpay",
   port: Number(process.env.PORT ?? 8787),
-  publicUrl: process.env.PUBLIC_URL ?? `http://localhost:${process.env.PORT ?? 8787}`,
+  publicUrl,
+  // WebAuthn: passkeys are bound to this host name and origin.
+  publicOrigin: new URL(publicUrl).origin,
+  rpId: process.env.PASSKEY_RP_ID ?? new URL(publicUrl).hostname,
+  // When true, approvals always need a passkey, even before the owner has registered one.
+  requirePasskey: process.env.REQUIRE_PASSKEY !== "false",
   stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? "",
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "",
   platformFeeBps: Number(process.env.PLATFORM_FEE_BPS ?? 1000),

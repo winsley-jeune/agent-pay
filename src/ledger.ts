@@ -1,7 +1,7 @@
 import type { Db, Tx } from "./db.js";
 
 export type SystemAccount = "holds" | "platform_fees" | "stripe_clearing" | "dev_clearing" | "payouts";
-export type TxnType = "topup" | "hold" | "capture" | "release" | "refund" | "payout" | "dev_credit";
+export type TxnType = "topup" | "hold" | "capture" | "release" | "refund" | "payout" | "dev_credit" | "subscription";
 
 export interface Entry {
   accountId: string;
