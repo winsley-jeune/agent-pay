@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: agentpay
+      POSTGRES_PASSWORD: agentpay
+      POSTGRES_DB: agentpay
+    ports:
+      - "5433:5432"
+    volumes:
+      - agentpay-db:/var/lib/postgresql/data
+      - ./migrations/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+volumes:
+  agentpay-db:
