@@ -45,7 +45,9 @@ const server = new McpServer(
       "Before subscribing, call browse_plans and prefer the suggestion that saves the most; never subscribe to two plans that cover the same need. " +
       "AgentPay also keeps the owner's everyday subscriptions (Netflix, Apple TV+, phone plan, gym...) in one list: use list_all_subscriptions, " +
       "add_subscription, import_bank_statement and savings_ideas. Those are billed by the merchant, not AgentPay. " +
-      "Never cancel one without request_cancel first; the owner approves, then follow cancel_guide and record it with mark_canceled.",
+      "Never cancel one without request_cancel first; the owner approves, then follow cancel_guide and record it with mark_canceled. " +
+      "Price watch and groceries: read prices and fill carts only in the owner's own browser, never bypass a store's bot protection, " +
+      "never buy a watched item yourself, and never check out a grocery order until request_order_approval is approved and the checkout total is within the approved maximum.",
   },
 );
 
