@@ -1,0 +1,37 @@
+{
+  "name": "agentpay",
+  "displayName": "AgentPay",
+  "version": "0.1.0",
+  "description": "Pay for paid tools and subscriptions from a prepaid wallet the owner controls, within levels, rules, envelopes and passkey approvals",
+  "author": { "name": "The AgentPay authors", "url": "https://github.com/winsley-jeune/agent-pay" },
+  "homepage": "https://github.com/winsley-jeune/agent-pay#readme",
+  "repository": "https://github.com/winsley-jeune/agent-pay",
+  "license": "MIT",
+  "keywords": ["payments", "mcp", "wallet", "spending-limits", "approvals", "passkeys", "subscriptions"],
+  "mcpServers": {
+    "agentpay": {
+      "command": "npx",
+      "args": ["-y", "@winsley-jeune/agentpay-mcp@latest"],
+      "env": {
+        "AGENTPAY_URL": "${user_config.server_url}",
+        "AGENTPAY_AGENT_KEY": "${user_config.agent_key}"
+      }
+    }
+  },
+  "userConfig": {
+    "server_url": {
+      "type": "string",
+      "title": "AgentPay server",
+      "description": "Where your AgentPay server runs, e.g. http://localhost:8787 when you self-host",
+      "default": "http://localhost:8787",
+      "required": true
+    },
+    "agent_key": {
+      "type": "string",
+      "title": "Agent key",
+      "description": "An agent key (ap_agent_...) created on your AgentPay dashboard's Agents tab. Its limits and level decide what this agent may spend.",
+      "required": true,
+      "sensitive": true
+    }
+  }
+}

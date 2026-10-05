@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import { AppError } from "./errors.js";
 
 // Things agents must never buy or pay for through AgentPay, and websites they
@@ -6,7 +7,7 @@ import { AppError } from "./errors.js";
 // it is a safety net, not a perfect classifier: the agent is also told to
 // refuse these on its own and, when in doubt, not to buy.
 
-export const RESTRICTED = ["adult", "medical", "weapons", "drugs", "alcohol", "tobacco", "gambling"] as const;
+export const RESTRICTED = ["adult", "medical", "weapons", "drugs", "alcohol", "tobacco", "gambling", "cash_like"] as const;
 export type RestrictedCategory = (typeof RESTRICTED)[number];
 
 export const CATEGORY_LABELS: Record<RestrictedCategory, string> = {
@@ -17,6 +18,7 @@ export const CATEGORY_LABELS: Record<RestrictedCategory, string> = {
   alcohol: "Alcohol",
   tobacco: "Tobacco, nicotine and vaping",
   gambling: "Gambling and lotteries",
+  cash_like: "Gift cards, prepaid cards, crypto and money transfers (how most scams take money)",
 };
 
 const TERMS: Record<RestrictedCategory, string[]> = {
@@ -49,6 +51,12 @@ const TERMS: Record<RestrictedCategory, string[]> = {
   ],
   tobacco: ["tobacco", "cigarette", "cigarettes", "cigar", "cigars", "vape", "vapes", "vaping", "e-cigarette", "juul", "nicotine", "hookah", "rolling papers"],
   gambling: ["casino", "gambling", "betting", "sportsbook", "sports betting", "lottery", "lotto", "slot machine", "slot machines", "draftkings", "fanduel"],
+  cash_like: [
+    "gift card", "gift cards", "giftcard", "giftcards", "e-gift card", "egift card", "prepaid card", "prepaid cards", "prepaid debit card",
+    "reload card", "reloadable card", "vanilla visa", "vanilla mastercard", "itunes card", "apple gift card", "google play card", "steam card",
+    "bitcoin", "buy crypto", "cryptocurrency", "bitcoin atm",
+    "western union", "moneygram", "wire transfer", "money order", "money orders", "money transfer", "zelle", "venmo", "cash app",
+  ],
 };
 
 // Everyday things that contain a restricted word but aren't restricted.
@@ -69,6 +77,10 @@ const SITES: Partial<Record<RestrictedCategory, string[]>> = {
   adult: ["pornhub.com", "xvideos.com", "onlyfans.com", "fansly.com", "chaturbate.com", "adultempire.com"],
   tobacco: ["juul.com", "vapewild.com", "element-vape.com", "smokecartel.com"],
   gambling: ["draftkings.com", "fanduel.com", "betmgm.com", "caesars.com", "pokerstars.com", "bet365.com"],
+  cash_like: [
+    "coinbase.com", "binance.com", "binance.us", "kraken.com", "crypto.com", "gemini.com", "westernunion.com", "moneygram.com", "remitly.com",
+    "giftcards.com", "raise.com", "cardcash.com", "giftcardgranny.com", "venmo.com", "cash.app", "paypal.me",
+  ],
 };
 // Words in a site's name that put it in a category ("bestrxpharmacy.com", "joesliquor.com").
 const SITE_WORDS: Partial<Record<RestrictedCategory, string[]>> = {
@@ -78,6 +90,7 @@ const SITE_WORDS: Partial<Record<RestrictedCategory, string[]>> = {
   adult: ["porn", "xxx"],
   tobacco: ["vape", "tobacco", "smokeshop"],
   gambling: ["casino", "betting", "sportsbook", "lottery"],
+  cash_like: ["giftcard", "bitcoin", "crypto"],
 };
 
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

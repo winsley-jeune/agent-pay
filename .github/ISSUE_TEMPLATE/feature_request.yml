@@ -1,0 +1,21 @@
+name: Feature request
+description: An idea for AgentPay
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The situation, not the solution. Who is the owner, what is the agent doing?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+  - type: checkboxes
+    id: money
+    attributes:
+      label: Money and authority
+      options:
+        - label: This would let an agent spend more, or with less approval (explain the safeguard above)

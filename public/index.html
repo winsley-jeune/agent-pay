@@ -54,6 +54,11 @@
   .terms ul { margin: 4px 0 0; padding-left: 18px; }
   .rule input { width: 120px; }
   s.refused { color: var(--muted); }
+  header { flex-wrap: wrap; row-gap: 8px; }
+  header .count, .cnt { background: var(--bad); color: #fff; border-radius: 10px; padding: 0 6px; font-size: 12px; margin-left: 4px; }
+  .helping-banner { background: var(--chip); border-bottom: 2px solid var(--warn); padding: 10px 20px; font-size: 14px; }
+  .code-box { border: 2px dashed var(--accent); border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
+  .code-box pre { font-size: 16px; user-select: all; margin: 6px 0; }
 </style>
 </head>
 <body>
@@ -73,15 +78,26 @@ let token = null;
 try { token = localStorage.getItem("agentpay.token"); } catch {}
 let me = null;
 let tab = location.hash.slice(1) || "board";
+// Trusted helper mode: the ownerId of the account we're helping, or null for our own account.
+let acting = null;
+try { acting = sessionStorage.getItem("agentpay.acting") || null; } catch {}
+let fam = null; // last GET /api/family (always about our own account)
+function setActing(id) {
+  acting = id || null;
+  try { acting ? sessionStorage.setItem("agentpay.acting", acting) : sessionStorage.removeItem("agentpay.acting"); } catch {}
+}
+const actingName = () => { const h = fam?.helping?.find((x) => x.ownerId === acting); return h ? h.name || h.email : me?.user?.email ?? "this account"; };
 
 function toast(msg) {
   const t = $("#toast"); t.textContent = msg; t.style.display = "block";
   clearTimeout(toast.timer); toast.timer = setTimeout(() => (t.style.display = "none"), 4000);
 }
 
-async function api(method, path, body) {
+/** opts.own: always about our own account, even while helping someone. */
+async function api(method, path, body, opts = {}) {
   const res = await fetch(path, {
-    method, headers: { ...(token ? { authorization: "Bearer " + token } : {}), ...(body ? { "content-type": "application/json" } : {}) },
+    method, headers: { ...(token ? { authorization: "Bearer " + token } : {}), ...(body ? { "content-type": "application/json" } : {}),
+      ...(acting && !opts.own ? { "x-agentpay-account": acting } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
   const json = await res.json().catch(() => ({}));
@@ -103,7 +119,7 @@ function renderLogin() {
       <div class="row" style="margin-top:8px"><button id="signup">Create account</button></div>
       <div id="newtok"></div>
     </div>`;
-  $("#signin").onclick = act(async () => { token = $("#tok").value.trim(); await boot(); });
+  $("#signin").onclick = act(async () => { token = $("#tok").value.trim(); setActing(null); await boot(); });
   $("#signup").onclick = act(async () => {
     const r = await api("POST", "/api/signup", { email: $("#email").value.trim() });
     $("#newtok").innerHTML = `<p class="small">Your owner token (shown once; store it in a password manager):</p><pre>${esc(r.token)}</pre>`;
@@ -112,24 +128,62 @@ function renderLogin() {
 }
 
 // ------------------------------------------------------------------ shell
-const tabs = [["board", "Control"], ["all", "All subscriptions"], ["watch", "Price watch"], ["grocery", "Groceries"], ["perms", "Permissions"], ["wallet", "Wallet"], ["approvals", "Approvals"], ["subscriptions", "Agent plans"], ["agents", "Agent keys"], ["security", "Passkeys"], ["provider", "Sell tools"]];
+const tabs = [["board", "Control"], ["family", "Family"], ["all", "All subscriptions"], ["watch", "Price watch"], ["grocery", "Groceries"], ["perms", "Permissions"], ["wallet", "Wallet"], ["approvals", "Approvals"], ["subscriptions", "Agent plans"], ["agents", "Agent keys"], ["security", "Passkeys"], ["provider", "Sell tools"]];
+
+// A trusted helper sees only these tabs on someone else's account.
+const helperTabs = ["board", "approvals", "all"];
+const visibleTabs = () => tabs.filter(([k]) => (acting ? helperTabs.includes(k) : true));
 
 async function boot() {
   if (!token) return renderLogin();
-  try { me = await api("GET", "/api/me"); } catch { token = null; try { localStorage.removeItem("agentpay.token"); } catch {} return renderLogin(); }
+  try { me = await api("GET", "/api/me"); } catch {
+    if (acting) { setActing(null); return boot(); } // no longer a helper there: back to our own account
+    token = null; try { localStorage.removeItem("agentpay.token"); } catch {} return renderLogin();
+  }
   try { localStorage.setItem("agentpay.token", token); } catch {}
+  try { fam = await api("GET", "/api/family", undefined, { own: true }); } catch { fam = null; }
+  const vis = visibleTabs();
   $("#app").innerHTML = `
-    <header><h1>AgentPay</h1><span class="muted small">${esc(me.user.email)}</span>
-      <span class="balance" id="bal"></span><button id="logout">Sign out</button></header>
-    <nav>${tabs.map(([k, v]) => `<a href="#${k}" data-tab="${k}">${v}<span id="count-${k}"></span></a>`).join("")}</nav>
-    <main>${tabs.map(([k]) => `<section id="tab-${k}"></section>`).join("")}</main>`;
-  $("#logout").onclick = () => { try { localStorage.removeItem("agentpay.token"); } catch {} token = null; renderLogin(); };
-  const params = new URLSearchParams(location.search);
-  if (params.get("topup") === "success") toast("Payment received. Credits appear as soon as Stripe confirms it.");
-  if (params.get("topup") === "cancelled") toast("Top-up cancelled.");
+    <header><h1>AgentPay</h1><span class="muted small">${esc(me.signer?.email ?? me.user.email)}</span>
+      <span class="balance" id="bal"></span><span id="acct"></span><button id="logout">Sign out</button></header>
+    <nav>${vis.map(([k, v]) => `<a href="#${k}" data-tab="${k}">${v}<span id="count-${k}"></span></a>`).join("")}</nav>
+    ${acting ? `<div class="helping-banner">You're helping <b>${esc(actingName())}</b> as a trusted helper. You can see their account, freeze it, and co-sign or object to big approvals.
+      You can't spend or change settings. <a href="#" id="backown">Back to my account</a></div>` : ""}
+    <main>${vis.map(([k]) => `<section id="tab-${k}"></section>`).join("")}</main>`;
+  $("#logout").onclick = () => { try { localStorage.removeItem("agentpay.token"); } catch {} token = null; setActing(null); renderLogin(); };
+  if ($("#backown")) $("#backown").onclick = (e) => { e.preventDefault(); switchAccount(null); };
+  renderSwitcher();
+  if (!boot.started) {
+    boot.started = true;
+    const params = new URLSearchParams(location.search);
+    if (params.get("topup") === "success") toast("Payment received. Credits appear as soon as Stripe confirms it.");
+    if (params.get("topup") === "cancelled") toast("Top-up cancelled.");
+    setInterval(refreshCounts, 60000);
+  }
   show(tab);
   refreshCounts();
-  setInterval(refreshCounts, 60000);
+}
+
+/** Switch between our own account and an account we help; re-renders everything. */
+async function switchAccount(ownerId) {
+  setActing(ownerId);
+  if (ownerId && !helperTabs.includes(tab)) { tab = "board"; history.replaceState(null, "", "#board"); }
+  await boot();
+}
+
+const helpCount = (h) => (h.unseenAlerts || 0) + (h.waitingForCosign || 0);
+function renderSwitcher() {
+  const el = $("#acct");
+  if (!el) return;
+  const helping = fam?.helping ?? [];
+  if (!helping.length && !acting) { el.innerHTML = ""; return; }
+  const total = helping.reduce((t, h) => t + helpCount(h), 0);
+  el.innerHTML = `<select id="acctsel" aria-label="Account" style="max-width:220px">
+      <option value="">My account</option>
+      ${helping.map((h) => `<option value="${esc(h.ownerId)}" ${h.ownerId === acting ? "selected" : ""}>${esc(h.name || h.email)}${helpCount(h) ? ` (${helpCount(h)})` : ""}</option>`).join("")}
+      ${acting && !helping.some((h) => h.ownerId === acting) ? `<option value="${esc(acting)}" selected>${esc(actingName())}</option>` : ""}
+    </select>${total && !acting ? `<span class="cnt" title="New alerts and approvals waiting for your co-signature">${total}</span>` : ""}`;
+  $("#acctsel").onchange = act(async (e) => switchAccount(e.target.value || null));
 }
 
 window.addEventListener("hashchange", () => token && me && show(location.hash.slice(1) || "board"));
@@ -137,7 +191,13 @@ window.addEventListener("hashchange", () => token && me && show(location.hash.sl
 async function refreshCounts() {
   try {
     me = await api("GET", "/api/me");
-    $("#bal").innerHTML = `<span class="muted small">Balance</span> <b>${usd(me.balanceCents)}</b>`;
+    $("#bal").innerHTML = `<span class="muted small">${acting ? "Their balance" : "Balance"}</span> <b>${usd(me.balanceCents)}</b>`;
+    if (!acting) {
+      fam = await api("GET", "/api/family", undefined, { own: true }).catch(() => fam);
+      const n = (fam?.helping ?? []).reduce((t, h) => t + helpCount(h), 0);
+      if ($("#count-family")) $("#count-family").innerHTML = n ? `<span class="count">${n}</span>` : "";
+      renderSwitcher();
+    }
     const { approvals } = await api("GET", "/api/approvals?status=pending");
     $("#count-approvals").innerHTML = approvals.length ? `<span class="count">${approvals.length}</span>` : "";
     const b = await api("GET", "/api/controls/board");
@@ -147,41 +207,41 @@ async function refreshCounts() {
 }
 
 function show(name) {
-  tab = tabs.some(([k]) => k === name) ? name : "board";
+  tab = visibleTabs().some(([k]) => k === name) ? name : "board";
   document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.tab === tab));
   document.querySelectorAll("main section").forEach((s) => s.classList.toggle("active", s.id === "tab-" + tab));
-  ({ board, all, watch, grocery, perms, wallet, approvals, subscriptions, agents, security, provider })[tab]().catch((e) => toast(e.message));
+  ({ board, family: familyTab, all, watch, grocery, perms, wallet, approvals, subscriptions, agents, security, provider })[tab]().catch((e) => toast(e.message));
 }
 
 // ------------------------------------------------------------------ control board
 const incidentKinds = [["misjudgment", "Agent misjudged"], ["condition_breach", "Broke my conditions"], ["system_bug", "AgentPay bug"], ["hijacked", "Agent was hijacked"], ["unclassified", "Not sure yet"]];
 const stateChip = (s) => `<span class="chip ${["active", "watching"].includes(s) ? "ok" : ["pending", "requested", "waiting", "trial", "cancel_requested", "pending_approval"].includes(s) ? "warn" : ""}">${esc(String(s).replaceAll("_", " "))}</span>`;
-const stopBtn = (s, label = "Stop", confirmText = "") => `<button class="danger" data-stop-m="${esc(s.method)}" data-stop-p="${esc(s.path)}"${confirmText ? ` data-confirm="${esc(confirmText)}"` : ""}>${label}</button>`;
+const stopBtn = (s, label = "Stop", confirmText = "") => acting ? "" : `<button class="danger" data-stop-m="${esc(s.method)}" data-stop-p="${esc(s.path)}"${confirmText ? ` data-confirm="${esc(confirmText)}"` : ""}>${label}</button>`;
 const group = (title, head, rows, empty) => `<h3 style="margin-top:14px">${title}</h3><div class="table-wrap"><table><tr>${head.map((h) => `<th>${h}</th>`).join("")}<th></th></tr>
   ${rows.join("") || `<tr><td colspan="${head.length + 1}" class="muted small">${empty}</td></tr>`}</table></div>`;
 
 async function board() {
   const el = $("#tab-board");
-  const [b, guarantee, policy, { entries }] = await Promise.all([api("GET", "/api/controls/board"), api("GET", "/api/controls/guarantee"),
+  const [b, guarantee, policy, { entries }] = await Promise.all([api("GET", "/api/controls/board"), acting ? null : api("GET", "/api/controls/guarantee"),
     api("GET", "/api/controls/policy"), api("GET", "/api/controls/audit")]);
   const lim = (l) => [l.perCallMaxCents != null && `${usd(l.perCallMaxCents)}/call`, l.dailyCapCents != null && `${usd(l.dailyCapCents)}/24h`,
     l.monthlyCapCents != null && `${usd(l.monthlyCapCents)}/30d`, l.approvalThresholdCents != null && `asks above ${usd(l.approvalThresholdCents)}`].filter(Boolean).join(" · ") || "no limits";
   el.innerHTML = `
     <div class="card" style="border:2px solid var(--bad)">
       ${b.frozenAt ? `<div class="spread"><div><h3 style="color:var(--bad)">Frozen since ${date(b.frozenAt)}</h3>
-          <p class="small">No agent can spend, AgentPay renewals are paused and pending approvals were declined. Unfreezing needs your passkey.</p></div>
-          <button class="primary" id="unfreeze">Unfreeze…</button></div>`
-        : `<div class="spread"><div><h3>Kill switch</h3><p class="small muted">Stops every agent at once, declines all pending approvals and pauses AgentPay renewals. No passkey needed; unfreezing later does need one.</p></div>
+          <p class="small">No agent can spend, AgentPay renewals are paused and pending approvals were declined. ${acting ? "Only the owner can start an unfreeze; you can co-sign it under Approvals." : "Unfreezing needs your passkey."}</p></div>
+          ${acting ? "" : `<button class="primary" id="unfreeze">Unfreeze…</button>`}</div>`
+        : `<div class="spread"><div><h3>Kill switch</h3><p class="small muted">Stops every agent at once, declines all pending approvals and pauses AgentPay renewals. No passkey needed; unfreezing later does need one${acting ? " and can only be started by the owner" : ""}.</p></div>
           <button class="kill" id="freeze">Freeze everything</button></div>`}
     </div>
     ${b.toReview.length ? `<div class="card"><h3>To review</h3><p class="small muted">These calls went through on their own but were flagged for you to look at.</p><div class="table-wrap"><table>
       <tr><th>Call</th><th class="num">Amount</th><th>Why flagged</th><th></th></tr>
       ${b.toReview.map((c) => `<tr><td><b>${esc(c.tool)}</b><div class="small muted">${esc(c.agentKeyName)} · ${date(c.createdAt)}</div>${c.agentReason ? `<div class="small">Agent's reason: “${esc(c.agentReason)}”</div>` : ""}</td>
         <td class="num">${usd(c.amountCents)}</td><td class="small">${esc(c.decidedBecause ?? "")}</td>
-        <td class="row"><button data-review-ok="${esc(c.id)}">Looks right</button><button class="danger" data-review-bad="${esc(c.id)}">Report problem</button></td></tr>`).join("")}
+        <td class="row">${acting ? "" : `<button data-review-ok="${esc(c.id)}">Looks right</button><button class="danger" data-review-bad="${esc(c.id)}">Report problem</button>`}</td></tr>`).join("")}
     </table></div></div>` : ""}
     ${b.reminders.length ? `<div class="card"><h3>Coming up</h3>${b.reminders.map((r) => `<div class="suggestion spread" style="border-color:var(--warn)"><div>${esc(r.message)}<div class="small muted">${esc(r.on)} · ${r.daysLeft} days</div></div>
-      <div class="row">${r.actions.includes("request_cancel") ? `<button data-rcancel="${esc(r.subscriptionId)}">Cancel…</button>` : ""}${r.actions.includes("accept_price") ? `<button data-accept="${esc(r.subscriptionId)}">Keep new price</button>` : ""}</div></div>`).join("")}</div>` : ""}
+      <div class="row">${acting ? "" : r.actions.includes("request_cancel") ? `<button data-rcancel="${esc(r.subscriptionId)}">Cancel…</button>` : ""}${acting || !r.actions.includes("accept_price") ? "" : `<button data-accept="${esc(r.subscriptionId)}">Keep new price</button>`}</div></div>`).join("")}</div>` : ""}
     <div class="card"><h3>Everything that can spend your money</h3>
       <p class="small muted">${b.pendingApprovals ? `<a href="#approvals">${b.pendingApprovals} waiting for approval</a> · ` : ""}Subscriptions ${usd(b.subscriptionTotals.monthlyCents)}/month (${usd(b.subscriptionTotals.yearlyCents)} a year)</p>
       ${group("Agents", ["Agent", "Level", "Spent", "Limits"], b.agents.map((a) => `<tr><td><b>${esc(a.name)}</b>${a.coolingOffUntil ? `<div class="small" style="color:var(--warn)">cooling off until ${date(a.coolingOffUntil)}</div>` : ""}</td>
@@ -199,7 +259,7 @@ async function board() {
         <td class="num">${usd(s.priceCents)}/${esc(s.interval)}</td><td>${stateChip(s.status)}</td><td class="small">${esc(s.nextRenewalOn ?? "")}</td>
         <td>${s.kind === "external" ? stopBtn(s.stop, "Cancel…") : stopBtn(s.stop, "Cancel")}</td></tr>`), "No subscriptions.")}
     </div>
-    <div class="card"><h3>Envelopes</h3>
+    ${acting ? "" : `<div class="card"><h3>Envelopes</h3>
       <p class="small muted">Set money aside for one job. An agent can only spend what's in the envelope, and it closes on its own when time runs out. Creating one needs your passkey.</p>
       <div class="grid" id="newenv">
         <label>Name<input name="name" placeholder="Trip research"></label>
@@ -209,21 +269,22 @@ async function board() {
         <label>Agent<select name="agent"><option value="">Any agent</option>${b.agents.map((a) => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join("")}</select></label>
         <label>Tools<input name="tools" placeholder="all tools (or comma-separated)"></label>
       </div><div class="row" style="margin-top:8px"><button class="primary" id="addenv">Create envelope</button></div>
-    </div>
+    </div>`}
     <div class="card"><h3>Vault</h3>
       <div class="spread"><div><div class="muted small">Locked away from agents</div><div class="big">${usd(b.vault.balanceCents)}</div>
         <div class="small muted">Unlocking needs your passkey and then waits ${esc(b.vault.unlockDelayHours)} hours.</div></div>
-        <div class="row"><input id="vamt" type="number" step="0.01" min="0.01" placeholder="Amount ($)" style="width:130px"><button id="vlock">Lock in vault</button><button id="vunlock">Unlock…</button></div></div>
+        ${acting ? "" : `<div class="row"><input id="vamt" type="number" step="0.01" min="0.01" placeholder="Amount ($)" style="width:130px"><button id="vlock">Lock in vault</button><button id="vunlock">Unlock…</button></div>`}</div>
       ${b.vault.unlocks.length ? `<table style="margin-top:8px">${b.vault.unlocks.map((u) => `<tr><td class="num">${usd(u.amountCents)}</td><td>${stateChip(u.status)}</td>
-        <td class="small">${u.availableAt ? "available " + date(u.availableAt) : "waiting for your approval"}</td><td><button class="danger" data-vcancel="${esc(u.id)}">Cancel</button></td></tr>`).join("")}</table>` : ""}
+        <td class="small">${u.availableAt ? "available " + date(u.availableAt) : acting ? "waiting for approval" : "waiting for your approval"}</td><td>${acting ? "" : `<button class="danger" data-vcancel="${esc(u.id)}">Cancel</button>`}</td></tr>`).join("")}</table>` : ""}
     </div>
-    <div class="card"><div class="spread"><h3>Incidents</h3><button id="report">Report an incident</button></div><div class="table-wrap"><table>
+    <div class="card"><div class="spread"><h3>Incidents</h3>${acting ? "" : `<button id="report">Report an incident</button>`}</div><div class="table-wrap"><table>
       ${b.openIncidents.map((i) => `<tr><td>${esc(i.description)}<div class="small muted">${i.agentKeyName ? esc(i.agentKeyName) + " · " : ""}${i.amountCents != null ? usd(i.amountCents) : ""}</div>
           <div class="small">${i.guarantee?.eligible ? `<span class="chip ok">covered up to ${usd(i.guarantee.upToCents)}</span> ` : ""}${esc(i.guarantee?.why ?? "")}</div></td>
-        <td><select data-kind="${esc(i.id)}">${incidentKinds.map(([k, l]) => `<option value="${k}" ${k === i.kind ? "selected" : ""}>${l}</option>`).join("")}</select></td>
-        <td><button data-resolve="${esc(i.id)}">Resolved</button></td></tr>`).join("") || `<tr><td class="muted small">No open incidents.</td></tr>`}
+        ${acting ? `<td><span class="chip">${esc((incidentKinds.find(([k]) => k === i.kind) ?? [, i.kind])[1])}</span></td><td></td>`
+          : `<td><select data-kind="${esc(i.id)}">${incidentKinds.map(([k, l]) => `<option value="${k}" ${k === i.kind ? "selected" : ""}>${l}</option>`).join("")}</select></td>
+        <td><button data-resolve="${esc(i.id)}">Resolved</button></td>`}</tr>`).join("") || `<tr><td class="muted small">No open incidents.</td></tr>`}
     </table></div>
-      <details style="margin-top:8px"><summary class="small muted">${guarantee.offered ? "Our guarantee" : "What we cover"}</summary>${guarantee.text.map((t) => `<p class="small">${esc(t)}</p>`).join("")}</details>
+      ${guarantee ? `<details style="margin-top:8px"><summary class="small muted">${guarantee.offered ? "Our guarantee" : "What we cover"}</summary>${guarantee.text.map((t) => `<p class="small">${esc(t)}</p>`).join("")}</details>` : ""}
     </div>
     <div class="card"><div class="spread"><h3>Why log</h3><button id="verify">Verify chain</button></div><div id="verifyres"></div>
       <p class="small muted">Every action, who took it, on whose instruction and why. Entries are chained so they can't be changed afterwards.</p>
@@ -289,6 +350,113 @@ async function board() {
   });
 }
 
+// ------------------------------------------------------------------ family: protected account and trusted helpers
+const helperState = { invited: ["invite sent", "warn"], active: ["active", "ok"], removing: ["being removed", "warn"] };
+
+async function familyTab() {
+  const el = $("#tab-family");
+  const f = (fam = await api("GET", "/api/family", undefined, { own: true }));
+  const p = f.protection;
+  el.innerHTML = `
+    <div class="card"><h3>Protected account ${p.protectedAt ? `<span class="chip ok">on since ${esc(new Date(p.protectedAt).toLocaleDateString())}</span>` : `<span class="chip">off</span>`}</h3>
+      <p class="small muted">You keep your money. A trusted helper can see your account, freeze it, and co-sign or object to big approvals, but can never spend, move money or approve anything alone.</p>
+      <div class="grid" id="prot">
+        <label style="flex-direction:row;align-items:center;gap:8px;color:var(--text)"><input type="checkbox" name="enabled" ${p.protectedAt ? "checked" : ""}> Protect my account</label>
+        <label>Approvals from ($) need a helper's signature or a wait<input name="threshold" type="number" min="0" step="0.01" value="${fromCents(p.cosignThresholdCents)}"></label>
+        <label>Wait (hours)<input name="delay" type="number" min="1" max="720" step="1" value="${esc(p.cosignDelayHours)}"></label>
+      </div>
+      <div class="row" style="margin-top:8px"><button class="primary" id="saveprot">Save</button></div>
+      <p class="small muted">When protected, approvals from ${usd(p.cosignThresholdCents)} need a trusted helper's signature, or they go through after the ${esc(p.cosignDelayHours)}-hour wait unless a helper objects.
+        Envelopes, browser permissions, buy mandates, unfreezing and vault unlocks always need the second signature.
+        Tightening applies right away; turning protection off or loosening it waits out the delay, and your helpers are told.</p>
+      ${f.scheduledChanges.length ? `<h3 style="margin-top:12px">Scheduled changes</h3><div class="table-wrap"><table>
+        ${f.scheduledChanges.map((c) => `<tr><td>${esc(c.summary)}</td><td class="small muted">takes effect ${date(c.effectiveAt)}</td>
+          <td><button class="danger" data-cancel-change="${esc(c.id)}">Cancel</button></td></tr>`).join("")}</table></div>` : ""}
+    </div>
+    <div class="card"><h3>Your name</h3>
+      <p class="small muted">Shown to the people who help you, so they know whose account it is.</p>
+      <div class="row"><input id="famname" placeholder="e.g. Rosa Alvarez" maxlength="80" value="${esc(f.displayName ?? "")}"><button id="savename">Save name</button></div>
+    </div>
+    <div class="card"><h3>Trusted helpers</h3>
+      <div class="table-wrap"><table><tr><th>Helper</th><th>Status</th><th></th></tr>
+        ${f.helpers.map((h) => { const [l, c] = helperState[h.status] ?? [h.status, ""]; return `<tr>
+          <td><b>${esc(h.label)}</b><div class="small muted">${h.email ? esc(h.email) : `invite sent${h.inviteExpiresAt ? ` · expires ${date(h.inviteExpiresAt)}` : ""}`}</div></td>
+          <td><span class="chip ${c}">${esc(l)}</span>${h.removingAt ? `<div class="small muted">removed on ${date(h.removingAt)}</div>` : ""}</td>
+          <td>${h.status === "removing" ? "" : `<button class="danger" data-rm-helper="${esc(h.id)}" data-label="${esc(h.label)}">Remove</button>`}</td></tr>`; }).join("")
+          || `<tr><td colspan="3" class="muted small">No trusted helpers yet.</td></tr>`}
+      </table></div>
+      <div class="row" style="margin-top:10px"><input id="helperlabel" placeholder="Maria (daughter)" maxlength="80"><button class="primary" id="invite">Invite a helper</button></div>
+      <div id="invitecode"></div>
+    </div>
+    <div class="card"><h3>Accounts you help</h3>
+      <div class="table-wrap"><table>
+        ${f.helping.map((h) => `<tr><td><b>${esc(h.name || h.email)}</b><div class="small muted">${h.name ? esc(h.email) + " · " : ""}you are ${esc(h.youAre)}</div>
+            <div class="row" style="margin-top:4px">${h.frozenAt ? `<span class="chip bad">frozen</span>` : ""}${h.protectedAt ? `<span class="chip ok">protected</span>` : ""}
+              ${h.unseenAlerts ? `<span class="chip warn">${esc(h.unseenAlerts)} new alert${h.unseenAlerts === 1 ? "" : "s"}</span>` : ""}
+              ${h.waitingForCosign ? `<span class="chip warn">${esc(h.waitingForCosign)} waiting for your co-signature</span>` : ""}</div></td>
+          <td class="row"><button class="primary" data-open-acct="${esc(h.ownerId)}">Open</button><button data-alerts="${esc(h.ownerId)}">Alerts</button>
+            <button class="danger" data-leave="${esc(h.ownerId)}" data-name="${esc(h.name || h.email)}">Stop helping</button></td></tr>`).join("")
+          || `<tr><td class="muted small">You don't help anyone yet.</td></tr>`}
+      </table></div>
+      <div id="famalerts"></div>
+    </div>
+    <div class="card"><h3>Accept an invitation</h3>
+      <p class="small muted">Someone asked you to be their trusted helper? Paste the code they gave you.</p>
+      <div class="row"><input id="invitein" placeholder="Invitation code" autocomplete="off" style="flex:1;min-width:180px"><button class="primary" id="accept">Accept</button></div>
+    </div>`;
+
+  const on = (sel, fn) => $(sel) && ($(sel).onclick = act(fn));
+  const again = async () => { await refreshCounts(); await familyTab(); };
+  on("#saveprot", async () => {
+    const v = (n) => $(`#prot [name=${n}]`);
+    const r = await api("POST", "/api/family/protection", { enabled: v("enabled").checked, cosignThresholdCents: toCents(v("threshold").value.trim()) ?? undefined,
+      cosignDelayHours: v("delay").value ? Number(v("delay").value) : undefined }, { own: true });
+    toast(r.scheduled ? r.message ?? `Scheduled for ${date(r.effectiveAt)}.` : "Saved.");
+    await again();
+  });
+  el.querySelectorAll("[data-cancel-change]").forEach((b) => (b.onclick = act(async () => { await api("DELETE", `/api/family/changes/${b.dataset.cancelChange}`, undefined, { own: true }); toast("Cancelled."); await again(); })));
+  on("#savename", async () => { await api("PUT", "/api/family/name", { name: $("#famname").value.trim() }, { own: true }); toast("Name saved."); });
+  on("#invite", async () => {
+    const label = $("#helperlabel").value.trim();
+    if (!label) return toast("Give your helper a name first, like \"Maria (daughter)\".");
+    const r = await api("POST", "/api/family/helpers", { label }, { own: true });
+    await refreshCounts(); await familyTab();
+    $("#invitecode").innerHTML = `<div class="code-box"><b class="small">Invitation code for ${esc(label)} (shown once)</b>
+      <pre id="codetext">${esc(r.code)}</pre>
+      <div class="row"><button id="copycode">Copy code</button><span class="small muted">Expires in ${esc(r.expiresInDays)} days</span></div>
+      <p class="small">${esc(r.note || "Give this to your helper; they accept it from their own AgentPay account.")}</p></div>`;
+    $("#copycode").onclick = async () => { try { await navigator.clipboard.writeText(r.code); toast("Copied."); } catch { toast("Select the code and copy it."); } };
+  });
+  el.querySelectorAll("[data-rm-helper]").forEach((b) => (b.onclick = act(async () => {
+    if (!confirm(`Remove ${b.dataset.label} as a trusted helper?`)) return;
+    const r = await api("DELETE", `/api/family/helpers/${b.dataset.rmHelper}`, undefined, { own: true });
+    toast(r.scheduled ? r.message ?? `Removed on ${date(r.effectiveAt)}.` : "Removed."); await again();
+  })));
+  el.querySelectorAll("[data-open-acct]").forEach((b) => (b.onclick = act(async () => switchAccount(b.dataset.openAcct))));
+  el.querySelectorAll("[data-alerts]").forEach((b) => (b.onclick = act(async () => {
+    const id = b.dataset.alerts;
+    const { alerts } = await api("GET", `/api/family/helping/${id}/alerts`, undefined, { own: true });
+    const h = f.helping.find((x) => x.ownerId === id);
+    $("#famalerts").innerHTML = `<h3 style="margin-top:14px">Alerts for ${esc(h ? h.name || h.email : "")}</h3><div class="table-wrap" style="max-height:420px;overflow-y:auto"><table>
+      <tr><th>When</th><th>Who</th><th>What</th></tr>
+      ${[...alerts].sort((x, y) => y.seq - x.seq).map((a) => `<tr><td class="small muted">${date(a.createdAt)}</td><td class="small">${esc(a.actor)}</td>
+        <td>${a.unseen ? `<span class="chip warn">new</span> ` : ""}<span class="chip">${esc(String(a.kind).replaceAll("_", " "))}</span> ${esc(a.summary)}
+          ${a.reason ? `<div class="small muted">Why: ${esc(a.reason)}</div>` : ""}${a.result ? `<div class="small muted">Result: ${esc(a.result)}</div>` : ""}</td></tr>`).join("")
+        || `<tr><td colspan="3" class="muted small">No alerts.</td></tr>`}</table></div>`;
+    if (alerts.some((a) => a.unseen)) { await api("POST", `/api/family/helping/${id}/alerts/seen`, {}, { own: true }); await refreshCounts(); }
+  })));
+  el.querySelectorAll("[data-leave]").forEach((b) => (b.onclick = act(async () => {
+    if (!confirm(`Stop helping ${b.dataset.name}? They'll be told, and you'll need a new invitation to help again.`)) return;
+    await api("POST", `/api/family/helping/${b.dataset.leave}/leave`, {}, { own: true }); toast("You no longer help on that account."); await again();
+  })));
+  on("#accept", async () => {
+    const code = $("#invitein").value.trim();
+    if (!code) return toast("Paste the invitation code first.");
+    const r = await api("POST", "/api/family/accept", { code }, { own: true });
+    toast(`You're now a trusted helper${r.label ? ` (as ${r.label})` : ""}. Find the account under Accounts you help.`); await again();
+  });
+}
+
 // ------------------------------------------------------------------ all subscriptions
 let catalog = null;
 const billedLabel = { direct: "Card", apple: "Apple", google: "Google Play", amazon: "Amazon", carrier: "Phone bill", other: "Other", agentpay: "AgentPay wallet" };
@@ -297,8 +465,9 @@ const statusLabel = { active: ["active", "ok"], trial: ["free trial", "warn"], c
 
 async function all() {
   const el = $("#tab-all");
-  catalog ??= await api("GET", "/api/everyday/catalog");
-  const [data, { suggestions }] = await Promise.all([api("GET", "/api/everyday"), api("GET", "/api/everyday/suggestions")]);
+  // A helper may only read the list itself (GET /api/everyday), not the catalog, suggestions or any change.
+  if (!acting) catalog ??= await api("GET", "/api/everyday/catalog");
+  const [data, { suggestions }] = await Promise.all([api("GET", "/api/everyday"), acting ? { suggestions: [] } : api("GET", "/api/everyday/suggestions")]);
   const cats = Object.entries(data.totals.byCategory).sort((a, b) => b[1] - a[1]);
   el.innerHTML = `
     <div class="card spread">
@@ -320,14 +489,14 @@ async function all() {
         <td class="num">${usd(i.priceCents)}/${i.interval}${i.interval !== "month" ? `<div class="small muted">≈ ${usd(i.monthlyCents)}/mo</div>` : ""}</td>
         <td class="small">${esc(i.nextRenewalOn ?? "")}</td>
         <td><span class="chip ${cls}">${esc(label)}</span></td>
-        <td class="row">${i.kind === "agentpay" ? `<a href="#subscriptions" class="small">manage</a>` : `
+        <td class="row">${acting ? "" : i.kind === "agentpay" ? `<a href="#subscriptions" class="small">manage</a>` : `
           <button data-guide="${i.id}">How to cancel</button>
           ${i.status !== "canceled" ? `<button data-done="${i.id}">Mark cancelled</button>` : ""}
           <button data-edit="${i.id}">Edit</button>`}</td></tr>
         <tr id="detail-${i.id}" style="display:none"><td colspan="6"></td></tr>`;
       }).join("") || `<tr><td colspan="6" class="muted">Nothing tracked yet. Add your subscriptions below or import a bank statement.</td></tr>`}
     </table></div></div>
-    <div class="card"><h3>Add a subscription</h3>
+    ${acting ? "" : `<div class="card"><h3>Add a subscription</h3>
       <div class="grid" id="addext">
         <label>Service<select name="service"><option value="">Other (type a name)</option>${catalog.services.map((s) => `<option value="${esc(s.slug)}">${esc(s.name)}</option>`).join("")}</select></label>
         <label>Name (if other)<input name="name"></label>
@@ -347,7 +516,8 @@ async function all() {
       <p class="small muted">Download a CSV of the last few months from your bank or card website and pick it here. It stays on this AgentPay server and is only used to find recurring charges.</p>
       <div class="row"><input type="file" id="csv" accept=".csv,text/csv"><button id="importbtn">Import</button></div>
       <div id="importres"></div>
-    </div>`;
+    </div>`}`;
+  if (acting) return;
 
   $("#addext [name=service]").onchange = (e) => {
     const s = catalog.services.find((x) => x.slug === e.target.value);
@@ -674,17 +844,30 @@ async function wallet() {
 }
 
 // ------------------------------------------------------------------ approvals
+// On a protected account an approval may need a second signature: the server then answers
+// {status: "pending", message}. We show that message and return false (not done yet).
+const signedButWaiting = (r) => { if (r?.status !== "pending") return false; toast(r.message ?? "Signed. Waiting for the second signature."); return true; };
+
 async function approveWithPasskey(id) {
-  if (!me.hasPasskey && me.requirePasskey) { toast("Register a passkey first (Passkeys tab)."); location.hash = "security"; return false; }
-  if (!me.hasPasskey) { await api("POST", `/api/approvals/${id}/approve`, {}); return true; }
+  if (!me.hasPasskey && me.requirePasskey) {
+    if (acting) { toast("Add a passkey in your own account first (My account › Passkeys)."); return false; }
+    toast("Register a passkey first (Passkeys tab)."); location.hash = "security"; return false;
+  }
+  if (!me.hasPasskey) return !signedButWaiting(await api("POST", `/api/approvals/${id}/approve`, {}));
   const { summary, options, terms } = await api("POST", `/api/approvals/${id}/start`);
   // The final confirmation: every flow shows the full terms before the passkey prompt, not only the Approvals tab.
   if (!confirm(`${summary}\n\nBefore you approve:\n${(terms ?? []).map((t) => `• ${t}`).join("\n")}\n\nContinue to your passkey?`)) return false;
   toast("Confirm on your device: " + summary);
   const passkey = await startAuthentication({ optionsJSON: options });
-  await api("POST", `/api/approvals/${id}/approve`, { passkey });
-  return true;
+  return !signedButWaiting(await api("POST", `/api/approvals/${id}/approve`, { passkey }));
 }
+
+// Kinds that always need a trusted helper's second signature on a protected account (mirrors the server).
+const cosignKinds = ["unfreeze", "vault_unlock", "browser_access", "risk_consent", "envelope", "buy_mandate"];
+const helperCanAct = (a) => !!me.protection?.protectedAt && (a.needsCosign || cosignKinds.includes(a.kind) || a.amountCents >= (me.protection.cosignThresholdCents ?? Infinity));
+const cosignStatus = (a) => !a.needsCosign ? "" : a.helperSignedAt ? "Co-signed by a helper — waiting for the owner"
+  : a.ownerSignedAt ? `Signed by owner — waiting for a trusted helper, or goes through on ${date(a.cosignDueAt)} unless a helper objects`
+  : "Protected account: needs the owner's signature and a trusted helper's (or a wait)";
 
 async function approvals() {
   const el = $("#tab-approvals");
@@ -692,7 +875,8 @@ async function approvals() {
   const pending = list.filter((a) => a.status === "pending");
   const done = list.filter((a) => a.status !== "pending").slice(0, 20);
   el.innerHTML = `
-    <div class="card"><h3>Waiting for you</h3>
+    <div class="card"><h3>${acting ? `Waiting for ${esc(actingName())}` : "Waiting for you"}</h3>
+      ${acting ? `<p class="small muted">As a trusted helper you can co-sign or object to approvals that need a second signature. Everything else is the owner's decision.</p>` : ""}
       ${pending.map((a) => `
         <div class="spread" style="padding:10px 0;border-bottom:1px solid var(--line)">
           <div><b>${esc(a.summary)}</b>
@@ -701,15 +885,22 @@ async function approvals() {
             ${a.why ? `<div class="small"><b>Why it's asking:</b> ${esc(a.why)}</div>` : ""}
             ${a.agentReason ? `<div class="small"><b>Agent's reason:</b> “${esc(a.agentReason)}”</div>` : a.input?.reason ? `<div class="small">Reason: “${esc(a.input.reason)}”</div>` : ""}
             ${a.kind === "call" ? `<div class="small muted">Input: <code>${esc(JSON.stringify(a.input).slice(0, 200))}</code></div>` : ""}
+            ${a.needsCosign ? `<div class="small" style="color:var(--warn)">${esc(cosignStatus(a))}</div>` : ""}
           </div>
-          <div class="row"><button class="primary" data-approve="${a.id}">Approve with passkey</button><button class="danger" data-deny="${a.id}">Deny</button></div>
+          <div class="row">${acting
+            ? (helperCanAct(a) && !a.helperSignedAt ? `<button class="primary" data-approve="${esc(a.id)}">Co-sign</button><button class="danger" data-deny="${esc(a.id)}">Object</button>`
+              : a.helperSignedAt ? "" : `<span class="small muted">Owner decides</span>`)
+            : `${a.ownerSignedAt ? "" : `<button class="primary" data-approve="${esc(a.id)}">Approve with passkey</button>`}<button class="danger" data-deny="${esc(a.id)}">Deny</button>`}</div>
         </div>`).join("") || `<p class="muted">Nothing to approve.</p>`}
     </div>
     <div class="card"><h3>Recent decisions</h3><div class="table-wrap"><table>
       ${done.map((a) => `<tr><td>${esc(a.summary)}</td><td><span class="chip ${a.status === "denied" ? "bad" : "ok"}">${a.status}</span></td><td class="small muted">${date(a.decidedAt)}</td></tr>`).join("") || `<tr><td class="muted">None yet.</td></tr>`}
     </table></div></div>`;
-  el.querySelectorAll("[data-approve]").forEach((b) => (b.onclick = act(async () => { if (await approveWithPasskey(b.dataset.approve)) toast("Approved."); await refreshCounts(); approvals(); })));
-  el.querySelectorAll("[data-deny]").forEach((b) => (b.onclick = act(async () => { await api("POST", `/api/approvals/${b.dataset.deny}/deny`); await refreshCounts(); approvals(); })));
+  el.querySelectorAll("[data-approve]").forEach((b) => (b.onclick = act(async () => { if (await approveWithPasskey(b.dataset.approve)) toast(acting ? "Co-signed." : "Approved."); await refreshCounts(); approvals(); })));
+  el.querySelectorAll("[data-deny]").forEach((b) => (b.onclick = act(async () => {
+    if (acting && !confirm("Object to this approval? It will be declined.")) return;
+    await api("POST", `/api/approvals/${b.dataset.deny}/deny`); if (acting) toast("Objected. The approval was declined."); await refreshCounts(); approvals();
+  })));
 }
 
 // ------------------------------------------------------------------ subscriptions
@@ -797,6 +988,7 @@ async function agents() {
   el.innerHTML = `
     <div class="card"><h3>New agent key</h3>
       <p class="small muted">Give each agent its own key so you can see, limit and revoke it separately.</p>
+      ${me.protection?.protectedAt ? `<p class="small" style="color:var(--warn)">This is a protected account: new agents start at L0 (ask for everything), and loosening an agent's limits waits ${esc(me.protection.cosignDelayHours)} hours.</p>` : ""}
       <div class="grid" id="newkey"><label>Name<input name="name" value="Claude Code"></label>${limitInputs({ perCallMaxCents: 100, dailyCapCents: 500, approvalThresholdCents: 50 })}</div>
       <div class="row" style="margin-top:10px"><button class="primary" id="create">Create key</button></div><div id="created"></div>
     </div>
@@ -820,7 +1012,10 @@ async function agents() {
       <p class="small">Add it to Claude Code:</p><pre>claude mcp add agentpay --scope user -e AGENTPAY_URL=${esc(location.origin)} -e AGENTPAY_AGENT_KEY=${esc(r.key)} -- npx -y tsx ${esc(me.mcpScript)}</pre>
       <p class="small">Or Claude Desktop (claude_desktop_config.json):</p><pre>${esc(JSON.stringify(cfg, null, 2))}</pre>`;
   });
-  el.querySelectorAll("[data-save]").forEach((b) => (b.onclick = act(async () => { await api("PATCH", `/api/agent-keys/${b.dataset.save}`, readLimits(b.closest(".card"))); toast("Limits saved."); })));
+  el.querySelectorAll("[data-save]").forEach((b) => (b.onclick = act(async () => {
+    const r = await api("PATCH", `/api/agent-keys/${b.dataset.save}`, readLimits(b.closest(".card")));
+    toast(r?.scheduled ? r.message ?? `Scheduled for ${date(r.effectiveAt)}.` : "Limits saved.");
+  })));
   el.querySelectorAll("[data-revoke]").forEach((b) => (b.onclick = act(async () => { await api("DELETE", `/api/agent-keys/${b.dataset.revoke}`); toast("Key revoked."); agents(); })));
 }
 

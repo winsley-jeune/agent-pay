@@ -1,6 +1,13 @@
 {
   "name": "agent-pay",
   "version": "1.0.0",
+  "description": "Open-source control panel for AI agents' spending: prepaid wallet, levels and rules, envelopes, passkey approvals, kill switch and a tamper-evident log, over MCP",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "db:up": "docker compose up -d",
     "db:down": "docker compose down",
@@ -8,13 +15,33 @@
     "seed": "tsx src/seed.ts",
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
-    "mcp": "tsx src/mcp.ts",
+    "mcp": "tsx packages/mcp/src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "seed:maria": "tsx src/seed-maria.ts"
+    "seed:maria": "tsx src/seed-maria.ts",
+    "build:mcp": "npm run build -w packages/mcp"
   },
-  "license": "UNLICENSED",
-  "description": "Prepaid credit wallet and payment gateway that lets AI agents pay for tools and API calls",
+  "keywords": [
+    "mcp",
+    "ai-agents",
+    "agent-payments",
+    "agentic-commerce",
+    "spending-controls",
+    "passkeys",
+    "webauthn",
+    "double-entry-ledger",
+    "subscriptions",
+    "claude"
+  ],
+  "homepage": "https://github.com/winsley-jeune/agent-pay#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/winsley-jeune/agent-pay.git"
+  },
+  "bugs": "https://github.com/winsley-jeune/agent-pay/issues",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
@@ -32,7 +59,5 @@
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^3.2.7"
-  },
-  "type": "module",
-  "private": true
+  }
 }

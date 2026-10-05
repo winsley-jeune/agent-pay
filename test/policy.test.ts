@@ -29,7 +29,10 @@ describe("restricted categories", () => {
     expect(screen("THC gummies")?.category).toBe("drugs");
     expect(screen("Marlboro cigarettes")?.category).toBe("tobacco");
     expect(screen("XXX adult video subscription")?.category).toBe("adult");
-    for (const fine of ["root beer", "red wine vinegar", "kale", "ginger", "glue gun sticks", "RXBAR protein bar", "alcohol-free hand soap", "rum extract", "burgundy towels"]) {
+    expect(screen("$500 Apple gift card")?.category).toBe("cash_like");
+    expect(screen("Buy Bitcoin")?.category).toBe("cash_like");
+    expect(screen("Western Union transfer")?.category).toBe("cash_like");
+    for (const fine of ["root beer", "red wine vinegar", "kale", "ginger", "glue gun sticks", "RXBAR protein bar", "alcohol-free hand soap", "rum extract", "burgundy towels", "cryptographic dice", "gifted children's book", "card table", "prepaid shipping label"]) {
       expect(screen(fine), fine).toBeNull();
     }
   });
@@ -40,6 +43,7 @@ describe("restricted categories", () => {
     expect(screenSite("bestrxpharmacy.net")?.category).toBe("medical");
     expect(screenSite("totalwine.com")?.category).toBe("alcohol");
     expect(screenSite("walmart.com")).toBeNull();
+    expect(screenSite("www.coinbase.com")?.category).toBe("cash_like");
     expect(screenSite("hammockstore.com")).toBeNull();
     expect(screenSite("essex.ac.uk")).toBeNull();
   });

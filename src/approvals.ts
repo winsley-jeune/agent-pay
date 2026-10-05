@@ -1,7 +1,7 @@
 import type { AuthenticationResponseJSON } from "@simplewebauthn/server";
 import type { AgentKey } from "./auth.js";
 import { config } from "./config.js";
-import type { Db } from "./db.js";
+import type { Db, Tx } from "./db.js";
 import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
 import { hasPasskey, startApprovalSignature, verifyApprovalSignature } from "./passkeys.js";
@@ -13,6 +13,7 @@ import { activateSubscription, resumeSubscription } from "./subscriptions.js";
 import { auditTx } from "./audit.js";
 import { activateEnvelope, applyUnfreeze, approveVaultUnlock, denyEnvelope, denyVaultUnlock } from "./controls.js";
 import { activateMandate, denyMandate } from "./mandates.js";
+import { getProtection, helperOn, needsCosign } from "./helpers.js";
 import { CHECKOUT_BUFFER } from "./grocery.js";
 
 export type ApprovalKind =
@@ -47,6 +48,7 @@ const approvalColumns = `ap.id, ap.kind, ap.status, ap.amount_cents AS "amountCe
   pl.slug AS plan, COALESCE(pl.interval, es.interval) AS interval, ap.subscription_id AS "subscriptionId",
   ap.external_subscription_id AS "externalSubscriptionId", es.name AS "externalName", ap.grocery_list_id AS "groceryListId", ap.agent_key_id AS "agentKeyId",
   k.name AS "agentKeyName", ap.why, ap.agent_reason AS "agentReason", s.max_price_cents AS "maxPriceCents", es.billed_through AS "billedThrough",
+  ap.needs_cosign AS "needsCosign", ap.owner_signed_at AS "ownerSignedAt", ap.helper_signed_at AS "helperSignedAt", ap.cosign_due_at AS "cosignDueAt",
   ap.created_at AS "createdAt", ap.decided_at AS "decidedAt"`;
 const approvalFrom = `approvals ap
   LEFT JOIN tools t ON t.id = ap.tool_id
@@ -186,115 +188,212 @@ export async function listApprovals(db: Db, userId: string, status?: string) {
   return rows.map((a: Approval) => ({ ...a, summary: describeApproval(a), terms: approvalTerms(a) }));
 }
 
-/** What an agent may see about one of its own approvals. */
+/** What an agent may see about one of its own approvals, including whether it waits for a second signature. */
 export async function approvalStatusForAgent(db: Db, agentKey: AgentKey, id: string) {
   const { rows } = await db.query(
     `SELECT ap.id, ap.kind, ap.status, ap.amount_cents AS "amountCents", ap.subscription_id AS "subscriptionId",
-            ap.external_subscription_id AS "externalSubscriptionId", ap.grocery_list_id AS "groceryListId"
+            ap.external_subscription_id AS "externalSubscriptionId", ap.grocery_list_id AS "groceryListId",
+            ap.needs_cosign AS "needsCosign", ap.owner_signed_at AS "ownerSignedAt", ap.helper_signed_at AS "helperSignedAt",
+            ap.cosign_due_at AS "cosignDueAt"
        FROM approvals ap WHERE ap.id = $1 AND ap.agent_key_id = $2`,
     [id, agentKey.id],
   );
-  if (!rows[0]) throw new AppError(404, "not_found", "approval not found");
-  return rows[0];
+  const a = rows[0];
+  if (!a) throw new AppError(404, "not_found", "approval not found");
+  let message: string | undefined;
+  if (a.status === "pending" && a.needsCosign) {
+    message = a.ownerSignedAt
+      ? `The owner approved. This is a protected account, so it also needs a trusted helper's signature, or it goes through on ${new Date(a.cosignDueAt).toISOString()} unless a helper objects. Wait; don't ask the owner to approve again.`
+      : "Waiting for the owner. This is a protected account: after the owner approves, it also needs a helper's signature or a waiting period.";
+  }
+  return { ...a, ...(message ? { message } : {}) };
 }
 
-/** Step 1 of approving: get WebAuthn options whose challenge is bound to this approval. */
-export async function startApproval(db: Db, userId: string, id: string) {
-  const approval = await getApproval(db, userId, id);
+/** Load an approval for someone who may act on it: its owner, or a trusted helper on the owner's account. */
+async function approvalForSigner(q: Db | Tx, signerId: string, id: string, lock = false) {
+  const { rows } = await q.query(
+    `SELECT id, user_id AS "ownerId", kind, status, amount_cents AS "amountCents", subscription_id AS "subscriptionId",
+            external_subscription_id AS "externalSubscriptionId", grocery_list_id AS "groceryListId", browser_grant_id AS "browserGrantId", input,
+            envelope_id AS "envelopeId", buy_mandate_id AS "buyMandateId", vault_unlock_id AS "vaultUnlockId",
+            owner_signed_at AS "ownerSignedAt", owner_passkey_id AS "ownerPasskeyId", helper_signed_at AS "helperSignedAt", cosign_due_at AS "cosignDueAt"
+       FROM approvals WHERE id = $1 ${lock ? "FOR UPDATE" : ""}`,
+    [id],
+  );
+  const approval = rows[0];
+  if (!approval) throw new AppError(404, "not_found", "approval not found");
+  if (approval.ownerId === signerId) return { approval, role: "owner" as const, helperLabel: null };
+  const helper = await helperOn(q, signerId, approval.ownerId);
+  if (!helper) throw new AppError(404, "not_found", "approval not found");
+  return { approval, role: "helper" as const, helperLabel: helper.label };
+}
+
+/** Step 1 of approving: get WebAuthn options whose challenge is bound to this approval. The signer is the owner or a helper. */
+export async function startApproval(db: Db, signerId: string, id: string) {
+  const { approval: row, role } = await approvalForSigner(db, signerId, id);
+  const approval = await getApproval(db, row.ownerId, id);
   if (approval.status !== "pending") throw new AppError(409, "not_pending", `this approval is already ${approval.status}`);
+  if (role === "helper" && !needsCosign(await getProtection(db, row.ownerId), approval.kind, approval.amountCents)) {
+    throw new AppError(403, "owner_only", "only the owner approves this; helpers co-sign the approvals that need a second signature");
+  }
   const summary = describeApproval(approval);
   const terms = approvalTerms(approval);
-  const options = await startApprovalSignature(db, userId, { id, amountCents: approval.amountCents, summary, terms });
-  return { summary, terms, options };
+  const options = await startApprovalSignature(db, signerId, { id, amountCents: approval.amountCents, summary, terms });
+  return { summary, terms, options, signingAs: role };
 }
 
 /**
- * Step 2 of approving. With a passkey signature, verifies it and applies the
- * approval: marks a call approval usable, or charges and activates a
- * subscription. Without one, only allowed when passkeys are not required and
- * the owner has none registered yet.
+ * Step 2 of approving. `signerId` is whoever signs: the owner, or a trusted
+ * helper co-signing on a protected account. With a passkey signature, verifies
+ * it; without one, only allowed when passkeys are not required and the signer
+ * has none registered yet.
+ *
+ * On a protected account, big and sensitive approvals need the owner's
+ * signature plus a helper's, or the owner's signature and the waiting period
+ * (completeDelayedApprovals). Helpers never approve alone.
  */
 export async function approve(
   db: Db,
-  userId: string,
+  signerId: string,
   id: string,
   passkeyResponse?: AuthenticationResponseJSON,
   opts: { requirePasskey?: boolean } = {},
 ) {
   const requirePasskey = opts.requirePasskey ?? config.requirePasskey;
   return withTx(db, async (tx) => {
-    const { rows } = await tx.query(
-      `SELECT id, kind, status, amount_cents AS "amountCents", subscription_id AS "subscriptionId",
-              external_subscription_id AS "externalSubscriptionId", grocery_list_id AS "groceryListId", browser_grant_id AS "browserGrantId", input,
-              envelope_id AS "envelopeId", buy_mandate_id AS "buyMandateId", vault_unlock_id AS "vaultUnlockId"
-         FROM approvals WHERE id = $1 AND user_id = $2 FOR UPDATE`,
-      [id, userId],
-    );
-    const approval = rows[0];
-    if (!approval) throw new AppError(404, "not_found", "approval not found");
+    const { approval, role, helperLabel } = await approvalForSigner(tx, signerId, id, true);
     if (approval.status !== "pending") throw new AppError(409, "not_pending", `this approval is already ${approval.status}`);
+    const ownerId: string = approval.ownerId;
 
     let passkeyId: string | null = null;
     if (passkeyResponse) {
-      passkeyId = await verifyApprovalSignature(tx, userId, id, passkeyResponse);
-    } else if (requirePasskey || (await hasPasskey(tx, userId))) {
+      passkeyId = await verifyApprovalSignature(tx, signerId, id, passkeyResponse);
+    } else if (requirePasskey || (await hasPasskey(tx, signerId))) {
       throw new AppError(401, "passkey_required", "approve this with your passkey");
     }
 
-    // Single calls stay 'approved' until the agent retries and uses them; subscription approvals apply now.
-    let newStatus = "approved";
-    if (approval.kind === "subscription") {
-      await activateSubscription(tx, approval.subscriptionId);
-      newStatus = "used";
-    } else if (approval.kind === "resume") {
-      await resumeSubscription(tx, approval.subscriptionId, approval.amountCents);
-      newStatus = "used";
-    } else if (approval.kind === "external_cancel") {
-      await approveExternalCancel(tx, approval.externalSubscriptionId);
-      newStatus = "used";
-    } else if (approval.kind === "risk_consent") {
-      await recordConsent(tx, userId, approval.input?.version, passkeyId);
-      newStatus = "used";
-    } else if (approval.kind === "browser_access") {
-      await activateGrant(tx, userId, approval.browserGrantId);
-      newStatus = "used";
-    } else if (approval.kind === "grocery_order") {
-      await approveGroceryOrder(tx, approval.groceryListId, approval.input ?? {});
-      newStatus = "used";
-    } else if (approval.kind === "envelope") {
-      await activateEnvelope(tx, userId, approval.envelopeId);
-      newStatus = "used";
-    } else if (approval.kind === "buy_mandate") {
-      await activateMandate(tx, approval.buyMandateId);
-      newStatus = "used";
-    } else if (approval.kind === "unfreeze") {
-      await applyUnfreeze(tx, userId);
-      newStatus = "used";
-    } else if (approval.kind === "vault_unlock") {
-      await approveVaultUnlock(tx, approval.vaultUnlockId);
-      newStatus = "used";
+    const protection = await getProtection(tx, ownerId);
+    const cosign = needsCosign(protection, approval.kind, approval.amountCents);
+    if (role === "helper" && !cosign) {
+      throw new AppError(403, "owner_only", "only the owner approves this; helpers co-sign the approvals that need a second signature");
     }
-    await tx.query("UPDATE approvals SET status = $2, decided_at = now(), passkey_id = $3 WHERE id = $1", [id, newStatus, passkeyId]);
-    await auditTx(tx, userId, {
-      actor: "owner", kind: "approved", summary: `Approved: ${approval.kind.replaceAll("_", " ")}`,
-      result: passkeyId ? "signed with a passkey" : "approved without a passkey", data: { approvalId: id, amountCents: approval.amountCents },
+    if (!cosign) return applyApproval(tx, approval, ownerId, passkeyId, "owner");
+
+    if (role === "owner") {
+      await tx.query(
+        `UPDATE approvals SET needs_cosign = true, owner_signed_at = now(), owner_passkey_id = $2,
+                cosign_due_at = COALESCE(cosign_due_at, now() + make_interval(hours => $3)) WHERE id = $1`,
+        [id, passkeyId, protection.cosignDelayHours],
+      );
+      if (approval.helperSignedAt) return applyApproval(tx, { ...approval, ownerPasskeyId: passkeyId }, ownerId, passkeyId, "owner and helper");
+    } else {
+      await tx.query("UPDATE approvals SET needs_cosign = true, helper_signed_by = $2, helper_signed_at = now(), helper_passkey_id = $3 WHERE id = $1", [id, signerId, passkeyId]);
+      if (approval.ownerSignedAt) return applyApproval(tx, approval, ownerId, approval.ownerPasskeyId, "owner and helper");
+    }
+    const { rows } = await tx.query(`SELECT cosign_due_at AS "dueAt" FROM approvals WHERE id = $1`, [id]);
+    const dueAt: Date | null = rows[0].dueAt;
+    const waitingFor = role === "owner" ? "helper_or_delay" : "owner";
+    await auditTx(tx, ownerId, {
+      actor: role, kind: "cosign_waiting",
+      summary: `${role === "owner" ? "Owner" : helperLabel} signed: ${approval.kind.replaceAll("_", " ")} ${approval.amountCents ? `for $${(approval.amountCents / 100).toFixed(2)}` : ""}`.trim(),
+      result: waitingFor === "owner" ? "waiting for the owner" : `waiting for a helper's signature, or goes through ${dueAt?.toISOString()}`,
+      data: { approvalId: id },
     });
-    return { id, status: newStatus, signedWithPasskey: passkeyId !== null };
+    return {
+      id, status: "pending" as const, waitingFor, completesAt: waitingFor === "owner" ? null : dueAt, signedWithPasskey: passkeyId !== null,
+      message:
+        waitingFor === "owner"
+          ? "Your co-signature is recorded. It takes effect once the owner approves."
+          : `Signed. This is a protected account: it takes effect when a trusted helper co-signs, or on ${dueAt?.toISOString()} if no helper objects.`,
+    };
   });
 }
 
-/** Saying no never spends money, so it needs no passkey. */
-export async function deny(db: Db, userId: string, id: string) {
+/** Apply an approval's effect, as the owner. */
+async function applyApproval(tx: Tx, approval: any, ownerId: string, passkeyId: string | null, signedBy: string) {
+  const id = approval.id;
+  // Single calls stay 'approved' until the agent retries and uses them; everything else applies now.
+  let newStatus = "approved";
+  if (approval.kind === "subscription") {
+    await activateSubscription(tx, approval.subscriptionId);
+    newStatus = "used";
+  } else if (approval.kind === "resume") {
+    await resumeSubscription(tx, approval.subscriptionId, approval.amountCents);
+    newStatus = "used";
+  } else if (approval.kind === "external_cancel") {
+    await approveExternalCancel(tx, approval.externalSubscriptionId);
+    newStatus = "used";
+  } else if (approval.kind === "risk_consent") {
+    await recordConsent(tx, ownerId, approval.input?.version, passkeyId);
+    newStatus = "used";
+  } else if (approval.kind === "browser_access") {
+    await activateGrant(tx, ownerId, approval.browserGrantId);
+    newStatus = "used";
+  } else if (approval.kind === "grocery_order") {
+    await approveGroceryOrder(tx, approval.groceryListId, approval.input ?? {});
+    newStatus = "used";
+  } else if (approval.kind === "envelope") {
+    await activateEnvelope(tx, ownerId, approval.envelopeId);
+    newStatus = "used";
+  } else if (approval.kind === "buy_mandate") {
+    await activateMandate(tx, approval.buyMandateId);
+    newStatus = "used";
+  } else if (approval.kind === "unfreeze") {
+    await applyUnfreeze(tx, ownerId);
+    newStatus = "used";
+  } else if (approval.kind === "vault_unlock") {
+    await approveVaultUnlock(tx, approval.vaultUnlockId);
+    newStatus = "used";
+  }
+  await tx.query("UPDATE approvals SET status = $2, decided_at = now(), passkey_id = $3 WHERE id = $1", [id, newStatus, passkeyId]);
+  await auditTx(tx, ownerId, {
+    actor: signedBy === "the waiting period" ? "system" : "owner", kind: "approved", summary: `Approved: ${approval.kind.replaceAll("_", " ")}`,
+    result: `${passkeyId ? "signed with a passkey" : "approved without a passkey"}; by ${signedBy}`, data: { approvalId: id, amountCents: approval.amountCents },
+  });
+  return { id, status: newStatus, signedWithPasskey: passkeyId !== null };
+}
+
+/** Owner-signed approvals on protected accounts whose waiting period is over and that no helper objected to. Run periodically. */
+export async function completeDelayedApprovals(db: Db): Promise<number> {
+  const { rows } = await db.query(
+    `SELECT id FROM approvals WHERE status = 'pending' AND needs_cosign AND owner_signed_at IS NOT NULL AND cosign_due_at <= now()`,
+  );
+  let done = 0;
+  for (const { id } of rows) {
+    try {
+      await withTx(db, async (tx) => {
+        const { rows: r } = await tx.query(`SELECT user_id AS "ownerId" FROM approvals WHERE id = $1`, [id]);
+        const { approval } = await approvalForSigner(tx, r[0].ownerId, id, true);
+        if (approval.status !== "pending" || !approval.ownerSignedAt) return;
+        await applyApproval(tx, approval, approval.ownerId, approval.ownerPasskeyId, "the waiting period");
+      });
+      done++;
+    } catch (err) {
+      // e.g. the wallet no longer has the money for an envelope: it stays pending for the owner to deal with.
+      console.error(`delayed approval ${id} could not complete:`, (err as Error).message);
+    }
+  }
+  return done;
+}
+
+/**
+ * Saying no never spends money, so it needs no passkey. A trusted helper can
+ * object to (deny) an approval that needs a second signature, but not others.
+ */
+export async function deny(db: Db, signerId: string, id: string) {
   return withTx(db, async (tx) => {
+    const { approval, role, helperLabel } = await approvalForSigner(tx, signerId, id, true);
+    if (approval.status !== "pending") throw new AppError(404, "not_found", "no pending approval with that id");
+    if (role === "helper" && !needsCosign(await getProtection(tx, approval.ownerId), approval.kind, approval.amountCents)) {
+      throw new AppError(403, "owner_only", "helpers can only object to approvals that need a second signature");
+    }
     const { rows } = await tx.query(
-      `UPDATE approvals SET status = 'denied', decided_at = now()
-        WHERE id = $1 AND user_id = $2 AND status = 'pending'
+      `UPDATE approvals SET status = 'denied', decided_at = now(), denied_by = $2
+        WHERE id = $1 AND status = 'pending'
         RETURNING kind, subscription_id AS "subscriptionId", external_subscription_id AS "externalSubscriptionId",
                   grocery_list_id AS "groceryListId", browser_grant_id AS "browserGrantId", input,
                   envelope_id AS "envelopeId", buy_mandate_id AS "buyMandateId", vault_unlock_id AS "vaultUnlockId"`,
-      [id, userId],
+      [id, signerId],
     );
-    if (!rows[0]) throw new AppError(404, "not_found", "no pending approval with that id");
     if (rows[0].kind === "subscription") {
       await tx.query("UPDATE subscriptions SET status = 'denied' WHERE id = $1 AND status = 'pending_approval'", [rows[0].subscriptionId]);
     }
@@ -305,6 +404,11 @@ export async function deny(db: Db, userId: string, id: string) {
     if (rows[0].kind === "vault_unlock") await denyVaultUnlock(tx, rows[0].vaultUnlockId);
     if (rows[0].kind === "external_cancel") {
       await denyExternalCancel(tx, rows[0].externalSubscriptionId, rows[0].input?.previousStatus);
+    }
+    if (role === "helper") {
+      await auditTx(tx, approval.ownerId, {
+        actor: "helper", kind: "denied", summary: `${helperLabel} objected: ${approval.kind.replaceAll("_", " ")} was declined`, data: { approvalId: id },
+      });
     }
   });
 }

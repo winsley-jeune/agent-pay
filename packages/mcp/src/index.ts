@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+// SPDX-License-Identifier: MIT
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -60,6 +62,8 @@ const server = new McpServer(
       "Money the owner set aside in an envelope pays matching calls without asking again; ask for one with request_envelope when a task needs many small payments. " +
       "Pass reason and instruction to call_paid_tool and log_browser_activity: the owner's log keeps what they asked for, why you acted and what happened. " +
       "If any result says frozen, stop everything and tell the owner; only they can unfreeze. " +
+      "On a protected account, big or sensitive approvals also need a trusted helper's signature or a waiting period after the owner approves: " +
+      "if check_approval says so, wait and don't ask the owner to approve again. Never pressure the owner to hurry an approval or to remove a helper. " +
       "Never buy a watched item unless check_buy_mandate says allowed for that price and site, right before checkout; then record the price with mark_bought. " +
       "If you made a mistake that cost money, say so and record it with report_mistake.",
   },

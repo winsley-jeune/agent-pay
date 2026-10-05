@@ -1,0 +1,51 @@
+{
+  "name": "@winsley-jeune/agentpay-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that lets Claude, Cursor or any MCP client pay for tools and subscriptions from an AgentPay wallet, within limits and approvals the owner controls",
+  "mcpName": "io.github.winsley-jeune/agentpay",
+  "type": "module",
+  "bin": {
+    "agentpay-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.6.5"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "ai-agents",
+    "agent-payments",
+    "agentic-commerce",
+    "claude",
+    "claude-code",
+    "cursor",
+    "spending-limits",
+    "passkeys",
+    "wallet"
+  ],
+  "homepage": "https://github.com/winsley-jeune/agent-pay#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/winsley-jeune/agent-pay.git",
+    "directory": "packages/mcp"
+  },
+  "bugs": "https://github.com/winsley-jeune/agent-pay/issues",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

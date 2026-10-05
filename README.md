@@ -1,16 +1,37 @@
 # AgentPay
 
-A prepaid wallet that lets AI agents pay for tools, API calls and subscriptions, with spending limits and passkey approvals that the human owner controls.
+[![CI](https://github.com/winsley-jeune/agent-pay/actions/workflows/ci.yml/badge.svg)](https://github.com/winsley-jeune/agent-pay/actions/workflows/ci.yml)
+[![License: AGPL-3.0 / MIT](https://img.shields.io/badge/license-AGPL--3.0%20%2F%20MIT-blue)](LICENSING.md)
+[![MCP](https://img.shields.io/badge/MCP-server-black)](packages/mcp)
 
-- **Owners** top up credits by card (Stripe), give each agent its own key with limits, and approve big spending with a passkey on their own device.
-- **Agents** (Claude Code, Claude Desktop or any MCP client) call paid tools, request subscriptions, and get savings suggestions through an MCP server.
-- **Providers** list APIs as paid tools (per call or per unit) and sell subscription plans that include calls, then request payouts of their earnings.
+**The open-source control panel for your AI agents' spending.** Claude Code, Cursor or any MCP agent pays for tools, APIs and subscriptions from a prepaid wallet. You decide how far each agent can go.
+
+- **Levels per agent:**
+  - L0: asks before every paid call
+  - L1: pays only what your rules allow
+  - L2: pays on its own within its limits
+- **Envelopes**: money set aside for one agent or task, returned when it ends.
+- **Passkey approvals** on your own device, with the full terms shown before you sign.
+- **A kill switch** that stops every agent at once, and a **vault** no agent can touch.
+- **A tamper-evident "why" log**: what each agent did, what you asked for, and why it was allowed.
+- **Hard refusals**: agents never buy adult content, medicine, weapons, drugs, alcohol, tobacco or gambling.
+- Also: everyday subscriptions (Netflix, phone, gym) in one list with one-tap cancel, price watch with signed buy mandates, and grocery carts filled in your own browser with approval before checkout.
+
+Self-host it in a few minutes, or use the [MCP server](packages/mcp) and [Claude Code plugin](plugins/agentpay) against your own server.
+
+> **Status: working MVP, not a licensed money service.** Use Stripe **test mode** unless you've done your own legal review. See [Not production-ready yet](#not-production-ready-yet) and [docs/us-market.md](docs/us-market.md).
+
+**Who it's for:**
+- **Owners** top up credits by card (Stripe), give each agent its own key, level and limits, and approve with a passkey.
+- **Agents** (Claude Code, Claude Desktop, Cursor or any MCP client) call paid tools, request subscriptions and envelopes, and log why they act, through the MCP server.
+- **Providers** list APIs as paid tools (per call or per unit) and sell subscription plans that include calls.
 
 ## Quick start
 
 Needs Docker and Node 20+.
 
 ```sh
+git clone https://github.com/winsley-jeune/agent-pay && cd agent-pay
 npm install
 npm run db:up        # Postgres on localhost:5433
 cp .env.example .env # then edit; Stripe keys are optional for local use
@@ -18,15 +39,22 @@ npm run seed         # demo provider, tools, plans, and a demo owner with $20 te
 npm start            # http://localhost:8787
 ```
 
-`npm run seed` writes the demo owner token and agent key to `.demo-credentials.json` (git-ignored). Open the dashboard and sign in with the owner token.
+`npm run seed` writes the demo owner token and agent key to `.demo-credentials.json` (git-ignored). Open the dashboard and sign in with the owner token. For a real deployment, see [docs/self-hosting.md](docs/self-hosting.md).
 
-Connect an agent (the dashboard prints this command with a fresh key when you create one):
+Connect an agent. The dashboard prints this command with a fresh key when you create one:
 
 ```sh
-claude mcp add agentpay --scope user \
-  -e AGENTPAY_URL=http://localhost:8787 -e AGENTPAY_AGENT_KEY=ap_agent_... \
-  -- npx -y tsx /path/to/agent-pay/src/mcp.ts
+claude mcp add agentpay --scope user   -e AGENTPAY_URL=http://localhost:8787 -e AGENTPAY_AGENT_KEY=ap_agent_...   -- npx -y @winsley-jeune/agentpay-mcp
 ```
+
+Or install the Claude Code plugin, which adds the MCP server and a skill with the spending rules:
+
+```sh
+claude plugin marketplace add winsley-jeune/agent-pay
+claude plugin install agentpay@agentpay
+```
+
+Working from this repo, you can run the MCP server from source with `npx -y tsx packages/mcp/src/index.ts`. Configs for Cursor and Claude Desktop are in [packages/mcp](packages/mcp#install).
 
 Tests: `npm test` (needs the database running).
 
@@ -176,6 +204,27 @@ Ideas from agent payments in Asia ([docs/asia.md](docs/asia.md)), built for one 
   - every subscription
   - calls to review, open incidents and reminders
 
+## Protected accounts and trusted helpers
+
+For people who want someone they trust watching over their agents' spending: an older parent and an adult child, someone recovering from illness, anyone who has been targeted by scams.
+
+- **The owner keeps their money.** A **trusted helper** (up to 3) accepts an invitation from their own AgentPay account. A helper can:
+  - see the account: Control board, why log, approvals, subscriptions
+  - freeze it
+  - co-sign or object to big approvals
+
+  A helper can never spend, move money, create agent keys, change settings, approve alone, unfreeze alone, or lock the owner out. Helpers act on the owner's account with the `X-AgentPay-Account` header, which is limited to those actions.
+- **Protection is opt-in**, on the Family tab. On a protected account, the following need the owner's passkey **plus** a helper's co-signature, **or** a waiting period (72 hours by default) that any helper can stop by objecting:
+  - approvals from the co-sign threshold ($50 by default)
+  - envelopes, browser permissions, buy mandates, unfreezing, vault unlocks and the risk statement, at any amount
+
+  Scams run on urgency, and the wait breaks it. An unreachable helper only delays things; it never blocks the owner for good.
+- **Weakening protection waits too.** Turning it off, raising the threshold, shortening the wait, removing a helper, or loosening an agent's limits only takes effect after the waiting period, and helpers see it in their alerts. The owner can cancel it in the meantime. Tightening is immediate, and so is revoking an agent key.
+- **New agents start at L0** (ask before every paid call) on a protected account.
+- **Alerts.** Each helper sees what's new on the accounts they help: approvals asked for, refusals, freezes, co-signatures, incidents, protection changes. **They appear on the dashboard only; nothing sends an email or a text yet.**
+- **An allowance instead.** If the caregiver should hold the money, the caregiver is the owner: give the other person's agent its own key with a monthly cap at L0 or L1. AgentPay never moves money between people.
+- **Agents are told.** If an approval waits for a co-signature, `check_approval` says so, and agents must wait rather than ask again. They must never pressure the owner to hurry or to remove a helper.
+
 ## What agents refuse
 
 Agents never buy, pay for, add to a cart, or act on websites for:
@@ -186,6 +235,7 @@ Agents never buy, pay for, add to a cart, or act on websites for:
 - alcohol
 - tobacco, nicotine and vaping
 - gambling
+- gift cards, prepaid cards, crypto purchases and money transfers (the way most scams take money)
 
 The owner can't turn this off; they buy these themselves.
 
@@ -196,7 +246,7 @@ The owner can't turn this off; they buy these themselves.
   - watching a price and signing a buy mandate
   - picking a product
   - grocery items: a restricted item stays on the list as **refused** and can't be put in the cart
-  - browser permissions: pharmacy, liquor, gun, adult, vape and gambling sites, by a list of known stores and words in the site name (e.g. `walgreens.com`, `cvs.com`, `totalwine.com`, `…pharmacy.com`)
+  - browser permissions: pharmacy, liquor, gun, adult, vape, gambling, crypto-exchange, gift-card and money-transfer sites, by a list of known stores and words in the site name (e.g. `walgreens.com`, `cvs.com`, `totalwine.com`, `…pharmacy.com`)
 - **The agent also refuses on its own.** The MCP instructions say so, and `check_purchase_policy` checks anything it's unsure about.
 - **Matching is by words**, so it can miss things. It errs toward refusing, for example non-alcoholic beer, and leaves everyday items such as root beer, wine vinegar, kale and glue guns alone. See `src/policy.ts`.
 
@@ -251,3 +301,9 @@ This is a working MVP. Before handling real money:
 - **Provider secrets.** Upstream `Authorization` headers are stored in plain text. Encrypt them at rest.
 - **Provider endpoints.** These aren't sandboxed. Block private/internal addresses before letting untrusted providers register (SSRF).
 - **Hosting.** Run the API behind HTTPS. Passkeys need HTTPS everywhere except `localhost`.
+
+## Contributing, security and license
+
+- [CONTRIBUTING.md](CONTRIBUTING.md): setup, and the rules for changes that touch money
+- [SECURITY.md](SECURITY.md): report vulnerabilities privately
+- [LICENSING.md](LICENSING.md): the server and dashboard are [AGPL-3.0](LICENSE); the MCP server, Claude Code plugin and policy rules are [MIT](LICENSE-MIT)

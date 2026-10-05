@@ -4,6 +4,7 @@ import { z } from "zod";
 import { approvalStatusForAgent, approve, deny, listApprovals, startApproval } from "./approvals.js";
 import {
   agentKeyByToken,
+  userById,
   createAgentKey,
   createUser,
   listAgentKeys,
@@ -25,6 +26,11 @@ import { priceWatchRoutes } from "./pricewatch-routes.js";
 import { groceryRoutes } from "./grocery-routes.js";
 import { permissionsRoutes } from "./permissions-routes.js";
 import { agentControlsRoutes, controlsRoutes } from "./controls-routes.js";
+import { completeDelayedApprovals } from "./approvals.js";
+import { familyRoutes } from "./family-routes.js";
+import { applyDueChanges, getProtection, helperOn, scheduleAgentLimits } from "./helpers.js";
+import { auditTx } from "./audit.js";
+import { withTx } from "./db.js";
 import { frozenAt, frozenError, releaseVaultUnlocks, sweepEnvelopes } from "./controls.js";
 import { callPaidTool, getToolForAgent, spendSummary, sweepExpiredHolds } from "./gateway.js";
 import { decideCall } from "./controls.js";
@@ -51,7 +57,11 @@ declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
+      /** Whose account the request acts on. */
       user?: User;
+      /** Who is signed in: the owner, or a trusted helper acting on the owner's account. */
+      signer?: User;
+      helperLabel?: string;
       agentKey?: AgentKey;
     }
   }
@@ -93,14 +103,35 @@ export function createApp(db: Db) {
   app.use(["/api/grocery/photo", "/api/agent/grocery/photo"], express.json({ limit: "8mb" }));
   app.use(express.json({ limit: "256kb" }));
 
+  // A trusted helper acts on someone else's account with the X-AgentPay-Account header,
+  // and only on these routes: see, freeze, and co-sign or object to approvals.
+  const helperAllowed = (method: string, path: string) =>
+    (method === "GET" &&
+      ["/api/me", "/api/controls/board", "/api/controls/audit", "/api/controls/audit/verify", "/api/controls/policy", "/api/controls/incidents",
+       "/api/controls/reviews", "/api/approvals", "/api/everyday", "/api/ledger"].includes(path)) ||
+    (method === "POST" && (path === "/api/controls/freeze" || /^\/api\/approvals\/[^/]+\/(start|approve|deny)$/.test(path)));
+
   const ownerOnly = (req: Request, _res: Response, next: NextFunction) => {
     const token = bearer(req);
-    (token?.startsWith("ap_owner_") ? userByToken(db, token) : Promise.resolve(null)).then((user) => {
-      if (!user) return next(new AppError(401, "unauthorized", "send your owner token as 'Authorization: Bearer ap_owner_...'"));
+    (async () => {
+      const user = token?.startsWith("ap_owner_") ? await userByToken(db, token) : null;
+      if (!user) throw new AppError(401, "unauthorized", "send your owner token as 'Authorization: Bearer ap_owner_...'");
+      req.signer = user;
       req.user = user;
-      next();
-    }, next);
+      const account = req.header("x-agentpay-account");
+      if (account && account !== user.id) {
+        const helper = /^[0-9a-f-]{36}$/i.test(account) ? await helperOn(db, user.id, account) : null;
+        if (!helper) throw new AppError(403, "not_helper", "you're not a trusted helper on that account");
+        const path = req.originalUrl.split("?")[0].replace(/\/$/, "");
+        if (!helperAllowed(req.method, path)) {
+          throw new AppError(403, "helper_read_only", "trusted helpers can see the account, freeze it, and co-sign or object to approvals; nothing else");
+        }
+        req.user = (await userById(db, account))!;
+        req.helperLabel = helper.label;
+      }
+    })().then(() => next(), next);
   };
+  const signerId = (req: Request) => (req.signer ?? req.user)!.id;
   const agentOnly = (req: Request, _res: Response, next: NextFunction) => {
     const token = bearer(req);
     (token?.startsWith("ap_agent_") ? agentKeyByToken(db, token) : Promise.resolve(null)).then((key) => {
@@ -140,12 +171,16 @@ export function createApp(db: Db) {
     h(async (req) => ({
       user: { id: req.user!.id, email: req.user!.email },
       balanceCents: await balance(db, req.user!.walletAccountId),
-      hasPasskey: await hasPasskey(db, req.user!.id),
+      // Passkey state of whoever signs: the owner, or the helper acting for them.
+      hasPasskey: await hasPasskey(db, signerId(req)),
+      signer: { id: signerId(req), email: req.signer!.email },
+      actingAs: req.helperLabel ? "helper" : "owner",
+      protection: await getProtection(db, req.user!.id),
       requirePasskey: config.requirePasskey,
       stripeEnabled: !!config.stripeSecretKey,
       devCreditEnabled: config.allowDevCredit,
       // Lets the dashboard print a ready-to-paste MCP config for this install.
-      mcpScript: fileURLToPath(new URL("./mcp.ts", import.meta.url)).replaceAll("\\", "/"),
+      mcpScript: fileURLToPath(new URL("../packages/mcp/src/index.ts", import.meta.url)).replaceAll("\\", "/"),
     })),
   );
 
@@ -186,14 +221,24 @@ export function createApp(db: Db) {
     h(async (req) => {
       const body = parse(limitsSchema.extend({ name: z.string().min(1).max(80) }), req.body);
       const { name, ...limits } = body;
-      const { agentKey, key } = await createAgentKey(db, req.user!.id, name, limits);
+      // On a protected account, new agents start at L0: they ask before every paid call.
+      const protectedAccount = !!(await getProtection(db, req.user!.id)).protectedAt;
+      const { agentKey, key } = await createAgentKey(db, req.user!.id, name, protectedAccount ? { ...limits, level: "ask" } : limits);
+      await withTx(db, (tx) =>
+        auditTx(tx, req.user!.id, { actor: "owner", kind: "agent_key_created", summary: `Created agent key "${name}" (${agentKey.level})` }),
+      );
       return { agentKey, key, note: "Copy this key into your agent's MCP config now; it is shown only once." };
     }),
   );
   app.patch(
     "/api/agent-keys/:id",
     ownerOnly,
-    h(async (req) => ({ agentKey: await updateAgentKeyLimits(db, req.user!.id, String(req.params.id), parse(limitsSchema, req.body)) })),
+    h(async (req) => {
+      const limits = parse(limitsSchema, req.body);
+      // On a protected account, limit changes wait out the delay (revoking is still immediate).
+      if ((await getProtection(db, req.user!.id)).protectedAt) return scheduleAgentLimits(db, req.user!.id, String(req.params.id), limits);
+      return { agentKey: await updateAgentKeyLimits(db, req.user!.id, String(req.params.id), limits) };
+    }),
   );
   app.delete(
     "/api/agent-keys/:id",
@@ -209,20 +254,20 @@ export function createApp(db: Db) {
     ownerOnly,
     h(async (req) => ({ approvals: await listApprovals(db, req.user!.id, typeof req.query.status === "string" ? req.query.status : undefined) })),
   );
-  app.post("/api/approvals/:id/start", ownerOnly, h(async (req) => startApproval(db, req.user!.id, String(req.params.id))));
+  app.post("/api/approvals/:id/start", ownerOnly, h(async (req) => startApproval(db, signerId(req), String(req.params.id))));
   app.post(
     "/api/approvals/:id/approve",
     ownerOnly,
     h(async (req) => {
       const { passkey } = parse(z.object({ passkey: z.any().optional() }), req.body);
-      return approve(db, req.user!.id, String(req.params.id), passkey);
+      return approve(db, signerId(req), String(req.params.id), passkey);
     }),
   );
   app.post(
     "/api/approvals/:id/deny",
     ownerOnly,
     h(async (req) => {
-      await deny(db, req.user!.id, String(req.params.id));
+      await deny(db, signerId(req), String(req.params.id));
     }),
   );
 
@@ -469,6 +514,7 @@ export function createApp(db: Db) {
   app.use("/api/permissions", ownerOnly, permissionsRoutes(db, "owner"));
   app.use("/api/agent/controls", agentOnly, agentControlsRoutes(db));
   app.use("/api/controls", ownerOnly, controlsRoutes(db));
+  app.use("/api/family", ownerOnly, familyRoutes(db));
   app.use("/api/agent/permissions", agentOnly, permissionsRoutes(db, "agent"));
 
   // ------------------------------------------------------------ demo provider + dashboard
@@ -513,6 +559,8 @@ export function startJobs(db: Db) {
       const closed = await sweepEnvelopes(db);
       if (closed) console.log(`closed ${closed} expired envelope(s)`);
       await releaseVaultUnlocks(db);
+      await applyDueChanges(db);
+      await completeDelayedApprovals(db);
       for (const o of await renewDueSubscriptions(db)) console.log(`subscription ${o.subscriptionId}: ${o.outcome}${o.reason ? ` (${o.reason})` : ""}`);
     } catch (err) {
       console.error("background job failed", err);

@@ -61,7 +61,7 @@ export function controlsRoutes(db: Db) {
   const r = express.Router();
   const uid = (req: express.Request) => req.user!.id;
 
-  r.post("/freeze", h(async (req) => freeze(db, uid(req), deny)));
+  r.post("/freeze", h(async (req) => freeze(db, uid(req), deny, req.helperLabel ? { helperLabel: req.helperLabel } : null)));
   r.post("/unfreeze", h(async (req) => requestUnfreeze(db, uid(req))));
 
   r.get("/envelopes", h(async (req) => ({ envelopes: await listEnvelopes(db, uid(req), { includeEnded: req.query.all === "1" }) })));

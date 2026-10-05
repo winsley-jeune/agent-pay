@@ -2,7 +2,7 @@
 
 Written 2026-10-05. The research covers China, India, Japan, South Korea, Taiwan, Singapore, Hong Kong and Southeast Asia. Many 2026 facts come from trade press or Chinese and Korean search summaries, not primary documents. Tags: **[O]** official or primary source, **[P]** credible press, **[B]** blog or vendor only. Verify before quoting any figure externally.
 
-**Status (2026-10-05):** the seven patterns below are built. See "Owner controls" in the [README](../README.md). Family-style delegation (row 9 of the build table) and a refund payout for the guarantee are not built.
+**Status (2026-10-05):** the seven patterns below are built. See "Owner controls" in the [README](../README.md). Row 9 of the build table is now built as protected accounts with trusted helpers (see the README). Each person keeps their own wallet, and no money moves between people. A refund payout for the guarantee is not built.
 
 ## The short version
 

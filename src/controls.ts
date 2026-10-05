@@ -34,12 +34,20 @@ export function frozenError() {
  * only ever stops spending. `declinePending` is approvals.deny, passed in to
  * keep this module free of a circular import.
  */
-export async function freeze(db: Db, userId: string, declinePending: (db: Db, userId: string, id: string) => Promise<void>) {
+export async function freeze(
+  db: Db,
+  userId: string,
+  declinePending: (db: Db, userId: string, id: string) => Promise<void>,
+  by: { helperLabel: string } | null = null,
+) {
   const { rows } = await db.query("UPDATE users SET frozen_at = COALESCE(frozen_at, now()) WHERE id = $1 RETURNING frozen_at AS f", [userId]);
   const pending = await db.query("SELECT id FROM approvals WHERE user_id = $1 AND status = 'pending' AND kind <> 'unfreeze'", [userId]);
   for (const { id } of pending.rows) await declinePending(db, userId, id).catch(() => {});
   await withTx(db, (tx) =>
-    auditTx(tx, userId, { actor: "owner", kind: "freeze", summary: "Froze all agent activity", result: `${pending.rows.length} pending approval(s) declined` }),
+    auditTx(tx, userId, {
+      actor: by ? "helper" : "owner", kind: "freeze", summary: by ? `${by.helperLabel} froze all agent activity` : "Froze all agent activity",
+      result: `${pending.rows.length} pending approval(s) declined`,
+    }),
   );
   return { frozenAt: rows[0].f as Date, declined: pending.rows.length };
 }

@@ -34,6 +34,16 @@ export async function createUser(db: Db, email: string): Promise<{ user: User; t
   });
 }
 
+export async function userById(q: Db | Tx, id: string): Promise<User | null> {
+  const { rows } = await q.query(
+    `SELECT u.id, u.email, a.id AS "walletAccountId"
+       FROM users u JOIN accounts a ON a.owner_id = u.id AND a.kind = 'wallet'
+      WHERE u.id = $1`,
+    [id],
+  );
+  return rows[0] ?? null;
+}
+
 export async function userByToken(q: Db | Tx, token: string): Promise<User | null> {
   const { rows } = await q.query(
     `SELECT u.id, u.email, a.id AS "walletAccountId"

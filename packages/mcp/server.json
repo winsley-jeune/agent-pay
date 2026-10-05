@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.winsley-jeune/agentpay",
+  "title": "AgentPay",
+  "description": "Agents pay for tools and subscriptions from a wallet you control, with limits and passkey approvals",
+  "websiteUrl": "https://github.com/winsley-jeune/agent-pay",
+  "repository": {
+    "url": "https://github.com/winsley-jeune/agent-pay",
+    "source": "github",
+    "subfolder": "packages/mcp"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@winsley-jeune/agentpay-mcp",
+      "version": "0.1.0",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "AGENTPAY_URL",
+          "description": "Your AgentPay server, e.g. http://localhost:8787 when self-hosting",
+          "isRequired": true,
+          "isSecret": false,
+          "default": "http://localhost:8787"
+        },
+        {
+          "name": "AGENTPAY_AGENT_KEY",
+          "description": "Agent key (ap_agent_...) from your AgentPay dashboard; its limits and level decide what the agent may spend",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

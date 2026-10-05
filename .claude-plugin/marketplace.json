@@ -1,0 +1,15 @@
+{
+  "name": "agentpay",
+  "owner": { "name": "The AgentPay authors", "url": "https://github.com/winsley-jeune/agent-pay" },
+  "description": "Spending controls for your AI agents: wallet, levels, envelopes, passkey approvals and a kill switch",
+  "plugins": [
+    {
+      "name": "agentpay",
+      "displayName": "AgentPay",
+      "source": "./plugins/agentpay",
+      "description": "Let Claude Code pay for paid tools and subscriptions from a prepaid wallet you control: levels and rules, envelopes, passkey approvals, kill switch and a tamper-evident log",
+      "category": "finance",
+      "tags": ["payments", "mcp", "spending-limits", "approvals", "subscriptions", "agents"]
+    }
+  ]
+}

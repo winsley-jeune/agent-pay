@@ -1,0 +1,29 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Security problems (spending beyond a limit, approving without a passkey, reading another owner's data...) go to **Security → Report a vulnerability**, not here."
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Against a local install if you can. Never paste agent keys, owner tokens or Stripe keys.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit or version
+  - type: dropdown
+    id: part
+    attributes:
+      label: Part
+      options: [Server / API, Dashboard, MCP server, Claude Code plugin, Docs]

@@ -8,7 +8,7 @@ import { withTx } from "./db.js";
 // shows up when the chain is verified.
 
 export interface AuditEntry {
-  actor: "agent" | "owner" | "system";
+  actor: "agent" | "owner" | "system" | "helper";
   agentKeyId?: string | null;
   kind: string;
   summary: string;
