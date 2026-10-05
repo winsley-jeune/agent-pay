@@ -1,3 +1,4 @@
+import { syncCatalog } from "../src/catalog.js";
 import { createAgentKey, createUser, type AgentKeyLimits } from "../src/auth.js";
 import { createPool, type Db } from "../src/db.js";
 import { resetSystemAccountCache } from "../src/ledger.js";
@@ -12,6 +13,7 @@ export async function freshDb(): Promise<Db> {
   await db.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public;");
   resetSystemAccountCache();
   await migrate(db);
+  await syncCatalog(db);
   return db;
 }
 

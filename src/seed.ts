@@ -1,5 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { syncCatalog } from "./catalog.js";
 import { createAgentKey, createUser } from "./auth.js";
 import { config } from "./config.js";
 import { createPool } from "./db.js";
@@ -14,6 +15,7 @@ import { devCredit } from "./wallet.js";
 
 const db = createPool();
 await migrate(db);
+await syncCatalog(db);
 
 const existing = await toolBySlug(db, "weather-now", { includeInactive: true });
 if (existing) {

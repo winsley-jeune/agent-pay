@@ -6,9 +6,10 @@ import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
 import { hasPasskey, startApprovalSignature, verifyApprovalSignature } from "./passkeys.js";
 import type { Tool } from "./registry.js";
+import { approveExternalCancel, denyExternalCancel } from "./external.js";
 import { activateSubscription, resumeSubscription } from "./subscriptions.js";
 
-export type ApprovalKind = "call" | "subscription" | "resume";
+export type ApprovalKind = "call" | "subscription" | "resume" | "external_cancel";
 
 export interface Approval {
   id: string;
@@ -20,6 +21,8 @@ export interface Approval {
   plan: string | null;
   interval: string | null;
   subscriptionId: string | null;
+  externalSubscriptionId: string | null;
+  externalName: string | null;
   agentKeyId: string | null;
   agentKeyName: string | null;
   createdAt: Date;
@@ -27,17 +30,22 @@ export interface Approval {
 }
 
 const approvalColumns = `ap.id, ap.kind, ap.status, ap.amount_cents AS "amountCents", ap.input, t.slug AS tool,
-  pl.slug AS plan, pl.interval, ap.subscription_id AS "subscriptionId", ap.agent_key_id AS "agentKeyId",
+  pl.slug AS plan, COALESCE(pl.interval, es.interval) AS interval, ap.subscription_id AS "subscriptionId",
+  ap.external_subscription_id AS "externalSubscriptionId", es.name AS "externalName", ap.agent_key_id AS "agentKeyId",
   k.name AS "agentKeyName", ap.created_at AS "createdAt", ap.decided_at AS "decidedAt"`;
 const approvalFrom = `approvals ap
   LEFT JOIN tools t ON t.id = ap.tool_id
   LEFT JOIN subscriptions s ON s.id = ap.subscription_id
   LEFT JOIN plans pl ON pl.id = s.plan_id
+  LEFT JOIN external_subscriptions es ON es.id = ap.external_subscription_id
   LEFT JOIN agent_keys k ON k.id = ap.agent_key_id`;
 
 /** Human-readable line shown on the approval screen and bound into the passkey challenge. */
-export function describeApproval(a: Pick<Approval, "kind" | "amountCents" | "tool" | "plan" | "interval">): string {
+export function describeApproval(a: Pick<Approval, "kind" | "amountCents" | "tool" | "plan" | "interval" | "externalName">): string {
   const dollars = `$${(a.amountCents / 100).toFixed(2)}`;
+  if (a.kind === "external_cancel") {
+    return `Cancel ${a.externalName}${a.amountCents > 0 ? ` (early termination fee about ${dollars})` : ""}`;
+  }
   if (a.kind === "call") return `Pay ${dollars} for one call to ${a.tool}`;
   if (a.kind === "subscription") return `Subscribe to ${a.plan} for ${dollars} per ${a.interval}, renewing automatically`;
   return `Renew ${a.plan} at ${dollars} per ${a.interval}`;
@@ -71,7 +79,8 @@ export async function listApprovals(db: Db, userId: string, status?: string) {
 /** What an agent may see about one of its own approvals. */
 export async function approvalStatusForAgent(db: Db, agentKey: AgentKey, id: string) {
   const { rows } = await db.query(
-    `SELECT ap.id, ap.kind, ap.status, ap.amount_cents AS "amountCents", ap.subscription_id AS "subscriptionId"
+    `SELECT ap.id, ap.kind, ap.status, ap.amount_cents AS "amountCents", ap.subscription_id AS "subscriptionId",
+            ap.external_subscription_id AS "externalSubscriptionId"
        FROM approvals ap WHERE ap.id = $1 AND ap.agent_key_id = $2`,
     [id, agentKey.id],
   );
@@ -104,7 +113,8 @@ export async function approve(
   const requirePasskey = opts.requirePasskey ?? config.requirePasskey;
   return withTx(db, async (tx) => {
     const { rows } = await tx.query(
-      `SELECT id, kind, status, amount_cents AS "amountCents", subscription_id AS "subscriptionId"
+      `SELECT id, kind, status, amount_cents AS "amountCents", subscription_id AS "subscriptionId",
+              external_subscription_id AS "externalSubscriptionId"
          FROM approvals WHERE id = $1 AND user_id = $2 FOR UPDATE`,
       [id, userId],
     );
@@ -127,6 +137,9 @@ export async function approve(
     } else if (approval.kind === "resume") {
       await resumeSubscription(tx, approval.subscriptionId, approval.amountCents);
       newStatus = "used";
+    } else if (approval.kind === "external_cancel") {
+      await approveExternalCancel(tx, approval.externalSubscriptionId);
+      newStatus = "used";
     }
     await tx.query("UPDATE approvals SET status = $2, decided_at = now(), passkey_id = $3 WHERE id = $1", [id, newStatus, passkeyId]);
     return { id, status: newStatus, signedWithPasskey: passkeyId !== null };
@@ -139,12 +152,15 @@ export async function deny(db: Db, userId: string, id: string) {
     const { rows } = await tx.query(
       `UPDATE approvals SET status = 'denied', decided_at = now()
         WHERE id = $1 AND user_id = $2 AND status = 'pending'
-        RETURNING kind, subscription_id AS "subscriptionId"`,
+        RETURNING kind, subscription_id AS "subscriptionId", external_subscription_id AS "externalSubscriptionId", input`,
       [id, userId],
     );
     if (!rows[0]) throw new AppError(404, "not_found", "no pending approval with that id");
     if (rows[0].kind === "subscription") {
       await tx.query("UPDATE subscriptions SET status = 'denied' WHERE id = $1 AND status = 'pending_approval'", [rows[0].subscriptionId]);
+    }
+    if (rows[0].kind === "external_cancel") {
+      await denyExternalCancel(tx, rows[0].externalSubscriptionId, rows[0].input?.previousStatus);
     }
   });
 }

@@ -1,4 +1,5 @@
 import type { Db } from "./db.js";
+import { externalSuggestions } from "./external.js";
 import { listPlans, listSubscriptions, monthlyCents, type Plan } from "./subscriptions.js";
 
 export type Suggestion =
@@ -133,7 +134,9 @@ export async function recommend(db: Db, userId: string, opts: { category?: strin
     .sort((a, b) => a.monthlyCents - b.monthlyCents);
 
   suggestions.sort((a, b) => b.monthlySavingsCents - a.monthlySavingsCents);
-  return { suggestions, catalog };
+  // Ideas for everyday subscriptions (Netflix, phone, gym...) tracked outside the marketplace.
+  const everyday = await externalSuggestions(db, userId);
+  return { suggestions, everyday, catalog };
 }
 
 /** Convert a call allowance from one billing interval to another, rounding up. */

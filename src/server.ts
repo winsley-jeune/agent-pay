@@ -13,6 +13,7 @@ import {
   type AgentKey,
   type User,
 } from "./auth.js";
+import { syncCatalog } from "./catalog.js";
 import { config } from "./config.js";
 import { createPool, type Db } from "./db.js";
 import { AppError } from "./errors.js";
@@ -503,6 +504,7 @@ export function startJobs(db: Db) {
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const db = createPool();
   await migrate(db);
+  await syncCatalog(db);
   startJobs(db);
   createApp(db).listen(config.port, () => {
     console.log(`AgentPay listening on ${config.publicUrl}`);
