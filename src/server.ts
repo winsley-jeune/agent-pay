@@ -22,6 +22,7 @@ import { externalRoutes } from "./external-routes.js";
 import { rollRenewalDates } from "./external.js";
 import { expireWatches, refreshFromKeepa } from "./pricewatch.js";
 import { priceWatchRoutes } from "./pricewatch-routes.js";
+import { groceryRoutes } from "./grocery-routes.js";
 import { callPaidTool, getToolForAgent, spendSummary, sweepExpiredHolds } from "./gateway.js";
 import { balance, history } from "./ledger.js";
 import { migrate } from "./migrate.js";
@@ -78,6 +79,8 @@ export function createApp(db: Db) {
     }),
   );
 
+  // Grocery list photos need a larger body; body-parser skips bodies that are already parsed.
+  app.use(["/api/grocery/photo", "/api/agent/grocery/photo"], express.json({ limit: "8mb" }));
   app.use(express.json({ limit: "256kb" }));
 
   const ownerOnly = (req: Request, _res: Response, next: NextFunction) => {
@@ -448,6 +451,8 @@ export function createApp(db: Db) {
   app.use("/api/agent/everyday", agentOnly, externalRoutes(db, "agent"));
   app.use("/api/price-watch", ownerOnly, priceWatchRoutes(db, "owner"));
   app.use("/api/agent/price-watch", agentOnly, priceWatchRoutes(db, "agent"));
+  app.use("/api/grocery", ownerOnly, groceryRoutes(db, "owner"));
+  app.use("/api/agent/grocery", agentOnly, groceryRoutes(db, "agent"));
 
   // ------------------------------------------------------------ demo provider + dashboard
 

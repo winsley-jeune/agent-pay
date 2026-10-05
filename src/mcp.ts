@@ -406,4 +406,129 @@ server.registerTool(
   ({ watch_id }) => reply(api("POST", pw(`/${encodeURIComponent(watch_id)}/stop`), {})),
 );
 
+// ---------------------------------------------------------------- groceries
+
+const gr = (path = "") => `/api/agent/grocery${path}`;
+const groceryItem = z.object({
+  name: z.string(),
+  quantity: z.number().positive().optional(),
+  unit: z.string().optional(),
+  notes: z.string().optional(),
+  category: z.string().optional(),
+});
+
+server.registerTool(
+  "create_grocery_list",
+  {
+    title: "Make a grocery list",
+    description:
+      "Create a grocery list from items, from typed text (one item per line), or from a photo of a handwritten list (photo_path; AgentPay reads it). " +
+      "Then set the store and fill the cart: for each item, search the store in the owner's own browser, add it, and report it with update_grocery_item.",
+    inputSchema: {
+      title: z.string().optional(),
+      store: z.enum(["walmart", "whole_foods"]).optional(),
+      items: z.array(groceryItem).optional(),
+      text: z.string().optional().describe("e.g. '2 lb bananas\\nmilk x2\\neggs (large)'"),
+      photo_path: z.string().optional().describe("Path to a photo of the list on this computer (JPEG, PNG, WebP)"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  async ({ title, store, items, text, photo_path }) => {
+    if (photo_path) {
+      let data: Buffer;
+      try {
+        data = await readFile(photo_path);
+      } catch (err) {
+        return fail(`could not read ${photo_path}: ${(err as Error).message}`);
+      }
+      const ext = photo_path.toLowerCase().split(".").pop();
+      const mediaType = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : ext === "gif" ? "image/gif" : "image/jpeg";
+      return reply(api("POST", gr("/photo"), { imageBase64: data.toString("base64"), mediaType, store, title }));
+    }
+    if (!items?.length && !text) return fail("give items, text, or photo_path");
+    return reply(api("POST", gr(), { title, store, items, text }));
+  },
+);
+
+server.registerTool(
+  "get_grocery_list",
+  {
+    title: "Show a grocery list",
+    description: "Items with status, cart product and price, a search link for each item at the chosen store, and the running total.",
+    inputSchema: { list_id: z.string() },
+    annotations: { readOnlyHint: true },
+  },
+  ({ list_id }) => reply(api("GET", gr(`/${encodeURIComponent(list_id)}`))),
+);
+
+server.registerTool(
+  "list_grocery_lists",
+  { title: "All grocery lists", annotations: { readOnlyHint: true } },
+  () => reply(api("GET", gr())),
+);
+
+server.registerTool(
+  "set_grocery_store",
+  {
+    title: "Choose the store",
+    inputSchema: { list_id: z.string(), store: z.enum(["walmart", "whole_foods"]) },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  ({ list_id, store }) => reply(api("PATCH", gr(`/${encodeURIComponent(list_id)}`), { store })),
+);
+
+server.registerTool(
+  "update_grocery_item",
+  {
+    title: "Report a cart item",
+    description:
+      "After adding an item to the cart, record the product and the line price shown in the cart (in cents). " +
+      "If you used something else, set status 'substituted' and say what. If it isn't available, set 'unavailable'. " +
+      "Pick sensible defaults (store brand, the size written on the list) and mention choices in substitute_note.",
+    inputSchema: {
+      list_id: z.string(),
+      item_id: z.number().int(),
+      status: z.enum(["needed", "in_cart", "substituted", "unavailable", "removed"]).optional(),
+      product_name: z.string().optional(),
+      product_url: z.string().optional(),
+      price_cents: z.number().int().nonnegative().optional(),
+      substitute_note: z.string().optional(),
+      quantity: z.number().positive().optional(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  ({ list_id, item_id, ...u }) =>
+    reply(
+      api("PATCH", gr(`/${encodeURIComponent(list_id)}/items/${item_id}`), {
+        status: u.status, productName: u.product_name, productUrl: u.product_url, priceCents: u.price_cents, substituteNote: u.substitute_note, quantity: u.quantity,
+      }),
+    ),
+);
+
+server.registerTool(
+  "request_order_approval",
+  {
+    title: "Ask the owner to approve the order",
+    description:
+      "When every item is in the cart, swapped, or unavailable, ask the owner to approve the total with their passkey. " +
+      "Do not check out until check_approval says approved, and don't change the cart afterwards.",
+    inputSchema: { list_id: z.string() },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ list_id }) => reply(api("POST", gr(`/${encodeURIComponent(list_id)}/request-approval`), {})),
+);
+
+server.registerTool(
+  "mark_grocery_ordered",
+  {
+    title: "Record the placed order",
+    description:
+      "Only after the owner approved: before you press the store's final 'Place order' button, check the checkout total is within the approved maximum. " +
+      "Then record the order number and the final total in cents. A total above the approved maximum is refused; ask the owner instead.",
+    inputSchema: { list_id: z.string(), total_cents: z.number().int().positive(), order_number: z.string().optional() },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  ({ list_id, total_cents, order_number }) => reply(api("POST", gr(`/${encodeURIComponent(list_id)}/ordered`), { totalCents: total_cents, orderNumber: order_number })),
+);
+
 await server.connect(new StdioServerTransport());

@@ -7,9 +7,10 @@ import { AppError } from "./errors.js";
 import { hasPasskey, startApprovalSignature, verifyApprovalSignature } from "./passkeys.js";
 import type { Tool } from "./registry.js";
 import { approveExternalCancel, denyExternalCancel } from "./external.js";
+import { approveGroceryOrder, denyGroceryOrder } from "./grocery.js";
 import { activateSubscription, resumeSubscription } from "./subscriptions.js";
 
-export type ApprovalKind = "call" | "subscription" | "resume" | "external_cancel";
+export type ApprovalKind = "call" | "subscription" | "resume" | "external_cancel" | "grocery_order";
 
 export interface Approval {
   id: string;
@@ -31,7 +32,7 @@ export interface Approval {
 
 const approvalColumns = `ap.id, ap.kind, ap.status, ap.amount_cents AS "amountCents", ap.input, t.slug AS tool,
   pl.slug AS plan, COALESCE(pl.interval, es.interval) AS interval, ap.subscription_id AS "subscriptionId",
-  ap.external_subscription_id AS "externalSubscriptionId", es.name AS "externalName", ap.agent_key_id AS "agentKeyId",
+  ap.external_subscription_id AS "externalSubscriptionId", es.name AS "externalName", ap.grocery_list_id AS "groceryListId", ap.agent_key_id AS "agentKeyId",
   k.name AS "agentKeyName", ap.created_at AS "createdAt", ap.decided_at AS "decidedAt"`;
 const approvalFrom = `approvals ap
   LEFT JOIN tools t ON t.id = ap.tool_id
@@ -41,8 +42,13 @@ const approvalFrom = `approvals ap
   LEFT JOIN agent_keys k ON k.id = ap.agent_key_id`;
 
 /** Human-readable line shown on the approval screen and bound into the passkey challenge. */
-export function describeApproval(a: Pick<Approval, "kind" | "amountCents" | "tool" | "plan" | "interval" | "externalName">): string {
+export function describeApproval(a: Pick<Approval, "kind" | "amountCents" | "tool" | "plan" | "interval" | "externalName" | "input">): string {
   const dollars = `$${(a.amountCents / 100).toFixed(2)}`;
+  if (a.kind === "grocery_order") {
+    const i = a.input as { title?: string; store?: string; items?: number; maxCents?: number };
+    const store = i.store === "whole_foods" ? "Whole Foods" : "Walmart";
+    return `Place ${store} order "${i.title}" (${i.items} items): about ${dollars}, up to $${((i.maxCents ?? a.amountCents) / 100).toFixed(2)} at checkout`;
+  }
   if (a.kind === "external_cancel") {
     return `Cancel ${a.externalName}${a.amountCents > 0 ? ` (early termination fee about ${dollars})` : ""}`;
   }
@@ -80,7 +86,7 @@ export async function listApprovals(db: Db, userId: string, status?: string) {
 export async function approvalStatusForAgent(db: Db, agentKey: AgentKey, id: string) {
   const { rows } = await db.query(
     `SELECT ap.id, ap.kind, ap.status, ap.amount_cents AS "amountCents", ap.subscription_id AS "subscriptionId",
-            ap.external_subscription_id AS "externalSubscriptionId"
+            ap.external_subscription_id AS "externalSubscriptionId", ap.grocery_list_id AS "groceryListId"
        FROM approvals ap WHERE ap.id = $1 AND ap.agent_key_id = $2`,
     [id, agentKey.id],
   );
@@ -114,7 +120,7 @@ export async function approve(
   return withTx(db, async (tx) => {
     const { rows } = await tx.query(
       `SELECT id, kind, status, amount_cents AS "amountCents", subscription_id AS "subscriptionId",
-              external_subscription_id AS "externalSubscriptionId"
+              external_subscription_id AS "externalSubscriptionId", grocery_list_id AS "groceryListId", input
          FROM approvals WHERE id = $1 AND user_id = $2 FOR UPDATE`,
       [id, userId],
     );
@@ -140,6 +146,9 @@ export async function approve(
     } else if (approval.kind === "external_cancel") {
       await approveExternalCancel(tx, approval.externalSubscriptionId);
       newStatus = "used";
+    } else if (approval.kind === "grocery_order") {
+      await approveGroceryOrder(tx, approval.groceryListId, approval.input ?? {});
+      newStatus = "used";
     }
     await tx.query("UPDATE approvals SET status = $2, decided_at = now(), passkey_id = $3 WHERE id = $1", [id, newStatus, passkeyId]);
     return { id, status: newStatus, signedWithPasskey: passkeyId !== null };
@@ -152,13 +161,15 @@ export async function deny(db: Db, userId: string, id: string) {
     const { rows } = await tx.query(
       `UPDATE approvals SET status = 'denied', decided_at = now()
         WHERE id = $1 AND user_id = $2 AND status = 'pending'
-        RETURNING kind, subscription_id AS "subscriptionId", external_subscription_id AS "externalSubscriptionId", input`,
+        RETURNING kind, subscription_id AS "subscriptionId", external_subscription_id AS "externalSubscriptionId",
+                  grocery_list_id AS "groceryListId", input`,
       [id, userId],
     );
     if (!rows[0]) throw new AppError(404, "not_found", "no pending approval with that id");
     if (rows[0].kind === "subscription") {
       await tx.query("UPDATE subscriptions SET status = 'denied' WHERE id = $1 AND status = 'pending_approval'", [rows[0].subscriptionId]);
     }
+    if (rows[0].kind === "grocery_order") await denyGroceryOrder(tx, rows[0].groceryListId);
     if (rows[0].kind === "external_cancel") {
       await denyExternalCancel(tx, rows[0].externalSubscriptionId, rows[0].input?.previousStatus);
     }

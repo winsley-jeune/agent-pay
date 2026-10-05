@@ -16,6 +16,7 @@
   "license": "UNLICENSED",
   "description": "Prepaid credit wallet and payment gateway that lets AI agents pay for tools and API calls",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@simplewebauthn/browser": "^14.0.0",
     "@simplewebauthn/server": "^14.0.3",

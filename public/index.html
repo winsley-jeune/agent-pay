@@ -107,7 +107,7 @@ function renderLogin() {
 }
 
 // ------------------------------------------------------------------ shell
-const tabs = [["all", "All subscriptions"], ["watch", "Price watch"], ["wallet", "Wallet"], ["approvals", "Approvals"], ["subscriptions", "Agent plans"], ["agents", "Agent keys"], ["security", "Passkeys"], ["provider", "Sell tools"]];
+const tabs = [["all", "All subscriptions"], ["watch", "Price watch"], ["grocery", "Groceries"], ["wallet", "Wallet"], ["approvals", "Approvals"], ["subscriptions", "Agent plans"], ["agents", "Agent keys"], ["security", "Passkeys"], ["provider", "Sell tools"]];
 
 async function boot() {
   if (!token) return renderLogin();
@@ -142,7 +142,7 @@ function show(name) {
   tab = tabs.some(([k]) => k === name) ? name : "all";
   document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.tab === tab));
   document.querySelectorAll("main section").forEach((s) => s.classList.toggle("active", s.id === "tab-" + tab));
-  ({ all, watch, wallet, approvals, subscriptions, agents, security, provider })[tab]().catch((e) => toast(e.message));
+  ({ all, watch, grocery, wallet, approvals, subscriptions, agents, security, provider })[tab]().catch((e) => toast(e.message));
 }
 
 // ------------------------------------------------------------------ all subscriptions
@@ -325,6 +325,109 @@ async function watch() {
   })));
   el.querySelectorAll("[data-bought]").forEach((b) => (b.onclick = act(async () => { await api("POST", `/api/price-watch/${b.dataset.bought}/bought`, {}); toast("Nice. Marked as bought."); watch(); })));
   el.querySelectorAll("[data-stop]").forEach((b) => (b.onclick = act(async () => { await api("POST", `/api/price-watch/${b.dataset.stop}/stop`, {}); watch(); })));
+}
+
+// ------------------------------------------------------------------ groceries
+const storeNames = { walmart: "Walmart", whole_foods: "Whole Foods" };
+const listStatus = { draft: ["draft", ""], shopping: ["agent is shopping", "warn"], ready: ["waiting for your approval", "warn"], approved: ["approved, agent can check out", "ok"],
+  ordered: ["ordered", "ok"], canceled: ["cancelled", "bad"] };
+const itemStatus = { needed: ["to find", ""], in_cart: ["in cart", "ok"], substituted: ["swapped", "warn"], unavailable: ["unavailable", "bad"], removed: ["removed", "bad"] };
+
+/** Shrink a phone photo to at most 1600px on the long side, as JPEG, before uploading. */
+async function photoToBase64(file) {
+  const bmp = await createImageBitmap(file);
+  const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+  const canvas = Object.assign(document.createElement("canvas"), { width: Math.round(bmp.width * scale), height: Math.round(bmp.height * scale) });
+  canvas.getContext("2d").drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.85).split(",")[1];
+}
+
+let openList = null;
+async function grocery() {
+  const el = $("#tab-grocery");
+  const { lists } = await api("GET", "/api/grocery");
+  const detail = openList ? (await api("GET", `/api/grocery/${openList}`)).list : null;
+  el.innerHTML = `
+    <div class="card"><h3>New grocery list</h3>
+      <p class="small muted">Snap your handwritten list or type it. Your agent fills the cart at the store in your own browser, then asks you to approve the total before it checks out.</p>
+      <div class="grid">
+        <label>Store<select id="gstore"><option value="walmart">Walmart</option><option value="whole_foods">Whole Foods</option></select></label>
+        <label>Name<input id="gtitle" placeholder="Weekly groceries"></label>
+      </div>
+      <div class="row" style="margin-top:10px"><input type="file" id="gphoto" accept="image/*" capture="environment"><button class="primary" id="gphotobtn">Read photo</button></div>
+      <label style="margin-top:10px">Or type it, one item per line<textarea id="gtext" rows="4" style="font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text)" placeholder="2 lb bananas&#10;milk x2&#10;eggs (large)"></textarea></label>
+      <div class="row" style="margin-top:8px"><button id="gtextbtn">Create list</button></div>
+      <div id="gmsg"></div>
+    </div>
+    ${detail ? groceryDetail(detail) : ""}
+    <div class="card"><h3>Your lists</h3><table>
+      ${lists.map((l) => `<tr><td><a href="#grocery" data-open="${l.id}"><b>${esc(l.title)}</b></a><div class="small muted">${l.itemCount} items · ${esc(storeNames[l.store] ?? "no store yet")} · ${date(l.createdAt)}</div></td>
+        <td><span class="chip ${listStatus[l.status][1]}">${listStatus[l.status][0]}</span></td>
+        <td class="num">${l.orderedTotalCents ? usd(l.orderedTotalCents) : l.estimatedTotalCents ? "≈ " + usd(l.estimatedTotalCents) : ""}</td></tr>`).join("") || `<tr><td class="muted">No lists yet.</td></tr>`}
+    </table></div>`;
+
+  const created = (r) => { openList = r.list.id; toast(r.unreadable?.length ? `Couldn't read: ${r.unreadable.join(", ")}. Check those items.` : "List created."); grocery(); };
+  $("#gphotobtn").onclick = act(async () => {
+    const file = $("#gphoto").files[0];
+    if (!file) return toast("Take or choose a photo first.");
+    $("#gmsg").innerHTML = `<p class="small muted">Reading your list…</p>`;
+    try {
+      created(await api("POST", "/api/grocery/photo", { imageBase64: await photoToBase64(file), mediaType: "image/jpeg", store: $("#gstore").value, title: $("#gtitle").value || undefined }));
+    } finally { $("#gmsg") && ($("#gmsg").innerHTML = ""); }
+  });
+  $("#gtextbtn").onclick = act(async () => created(await api("POST", "/api/grocery", { text: $("#gtext").value, store: $("#gstore").value, title: $("#gtitle").value || undefined })));
+  el.querySelectorAll("[data-open]").forEach((a) => (a.onclick = (e) => { e.preventDefault(); openList = a.dataset.open; grocery(); }));
+  if (!detail) return;
+  const id = detail.id;
+  el.querySelectorAll("[data-gstatus]").forEach((b) => (b.onclick = act(async () => {
+    await api("PATCH", `/api/grocery/${id}/items/${b.dataset.item}`, { status: b.dataset.gstatus }); grocery();
+  })));
+  const on = (sel, fn) => $(sel) && ($(sel).onclick = act(fn));
+  on("#gsetstore", async () => { await api("PATCH", `/api/grocery/${id}`, { store: $("#gstore2").value }); grocery(); });
+  on("#greopen", async () => { await api("POST", `/api/grocery/${id}/reopen`); grocery(); });
+  on("#gcancel", async () => { await api("POST", `/api/grocery/${id}/cancel`); openList = null; grocery(); });
+  on("#gapprove", async () => {
+    const approvalsList = (await api("GET", "/api/approvals?status=pending")).approvals;
+    const ap = approvalsList.find((a) => a.groceryListId === detail.id);
+    if (!ap) return toast("No pending approval for this list.");
+    if (await approveWithPasskey(ap.id)) toast("Approved. Your agent can check out now.");
+    await refreshCounts(); grocery();
+  });
+  on("#gordered", async () => {
+    await api("POST", `/api/grocery/${id}/ordered`, { totalCents: toCents($("#gtotal").value), orderNumber: $("#gorder").value || undefined });
+    toast("Recorded."); grocery();
+  });
+}
+
+function groceryDetail(l) {
+  const [label, cls] = listStatus[l.status];
+  const editable = !["approved", "ordered", "canceled"].includes(l.status);
+  return `<div class="card">
+    <div class="spread"><div><h3>${esc(l.title)} <span class="chip ${cls}">${label}</span></h3>
+      <div class="small muted">${l.source === "photo" ? "read from a photo · " : ""}${esc(l.storeName ?? "no store yet")}${l.cartUrl ? ` · <a href="${esc(l.cartUrl)}" target="_blank" rel="noopener">open store</a>` : ""}</div>
+      ${l.unreadable?.length ? `<div class="small" style="color:var(--warn)">Couldn't read: ${l.unreadable.map(esc).join(", ")}</div>` : ""}</div>
+      <div><div class="muted small">Cart total</div><div class="big">${l.estimatedTotalCents ? usd(l.estimatedTotalCents) : "—"}</div>
+        ${l.approvedMaxCents ? `<div class="small muted">approved up to ${usd(l.approvedMaxCents)}</div>` : ""}</div></div>
+    <div class="table-wrap"><table><tr><th>Item</th><th>In the cart</th><th class="num">Price</th><th>Status</th><th></th></tr>
+      ${l.items.map((i) => {
+        const [s, c] = itemStatus[i.status];
+        return `<tr><td><b>${esc(i.name)}</b><div class="small muted">${[i.quantity ? `${i.quantity}${i.unit ? " " + esc(i.unit) : ""}` : "", esc(i.notes ?? "")].filter(Boolean).join(" · ")}</div></td>
+          <td class="small">${i.productUrl ? `<a href="${esc(i.productUrl)}" target="_blank" rel="noopener">${esc(i.productName ?? "product")}</a>` : esc(i.productName ?? "")}
+            ${i.substituteNote ? `<div style="color:var(--warn)">${esc(i.substituteNote)}</div>` : ""}${!i.productName && i.searchUrl ? `<a href="${esc(i.searchUrl)}" target="_blank" rel="noopener">search</a>` : ""}</td>
+          <td class="num">${i.priceCents != null ? usd(i.priceCents) : ""}</td><td><span class="chip ${c}">${s}</span></td>
+          <td>${editable && i.status !== "removed" ? `<button class="small" data-gstatus="removed" data-item="${i.id}">Remove</button>` : ""}</td></tr>`;
+      }).join("")}
+    </table></div>
+    <div class="row" style="margin-top:10px">
+      ${editable ? `<select id="gstore2">${Object.entries(storeNames).map(([k, v]) => `<option value="${k}" ${k === l.store ? "selected" : ""}>${v}</option>`).join("")}</select><button id="gsetstore">Set store</button>` : ""}
+      ${l.status === "ready" ? `<button class="primary" id="gapprove">Approve order with passkey</button>` : ""}
+      ${l.status === "approved" || l.status === "ready" ? `<button id="greopen">Reopen to change</button>` : ""}
+      ${l.status !== "ordered" && l.status !== "canceled" ? `<button class="danger" id="gcancel">Cancel list</button>` : ""}
+    </div>
+    ${l.status === "approved" ? `<div class="row" style="margin-top:8px"><input id="gtotal" type="number" step="0.01" placeholder="Final total ($)"><input id="gorder" placeholder="Order number"><button id="gordered">I placed the order</button></div>` : ""}
+    ${l.status === "ordered" ? `<p class="small">Ordered${l.orderNumber ? ` · #${esc(l.orderNumber)}` : ""} · ${usd(l.orderedTotalCents)} · ${date(l.orderedAt)}</p>` : ""}
+    ${l.storeNote ? `<p class="small muted">${esc(l.storeNote)}</p>` : ""}
+  </div>`;
 }
 
 // ------------------------------------------------------------------ wallet
