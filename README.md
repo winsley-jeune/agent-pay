@@ -86,6 +86,30 @@ Catalog prices (`src/catalog.ts`) are approximate US list prices as of the date 
 
 Try it with the demo: `npm run seed:maria` creates Maria (Netflix, Apple TV+, Paramount+ billed through Apple, Disney+, a Hulu trial, AT&T with a device balance, Planet Fitness, Spotify) and `examples/maria-statement.csv`. Her credentials are in `.demo-credentials.json`.
 
+## Price watch
+
+Paste a product link (Amazon or any store) and a target price. AgentPay **never scrapes stores, signs in to them, or buys**.
+
+- **Where prices come from.**
+  - The owner's agent reads the page in the owner's own browser and calls `record_price`.
+  - The owner enters a price.
+  - Keepa supplies prices automatically when `KEEPA_API_KEY` is set. The Keepa parsing is tested against sample responses only, not a live key.
+- **Alerts.** Target reached (once each time the price crosses it), a new lowest price, a drop of 10% or more from the previous price, and the deal ending.
+- **Timing advice.** Black Friday and Cyber Monday dates are calculated. Prime Day and Prime Big Deal Days are shown only as typical windows, because Amazon announces them each year.
+- **Links.** Amazon links are cleaned up to `/dp/ASIN`, without tracking or affiliate parameters.
+
+## Groceries
+
+Take a photo of a handwritten list (Claude Opus 5.5 reads it; needs `ANTHROPIC_API_KEY`) or type it.
+
+1. The owner's agent fills the cart at Walmart or Whole Foods in the owner's own browser. It reports each product and price, or what it swapped or couldn't find.
+2. When everything is accounted for, the owner approves the total with their passkey (up to +15% for weighed produce and fees).
+3. The agent may then check out and record the order, but only within the approved total.
+
+Changing the cart after asking for approval cancels that request. AgentPay has no store account. "Don't check out before approval" is a rule the agent follows; AgentPay can't block a store's checkout. Single-use virtual cards would make it a hard limit; see [docs/design/virtual-cards.md](docs/design/virtual-cards.md).
+
+Try it with `examples/grocery-list.png`.
+
 ## MCP tools
 
 | Tool | What it does |
@@ -103,6 +127,9 @@ Try it with the demo: `npm run seed:maria` creates Maria (Netflix, Apple TV+, Pa
 | `import_bank_statement` | Find subscriptions, price increases and charges after cancelling in a CSV |
 | `savings_ideas` | Bundles, cheaper tiers, unused services and more |
 | `cancel_guide` / `request_cancel` / `mark_canceled` | Cancel safely, with the owner's approval |
+| `watch_price` / `list_price_watches` / `record_price` / `mark_bought` / `stop_watch` | Wait for a sale |
+| `create_grocery_list` (items, text or photo) / `get_grocery_list` / `list_grocery_lists` / `set_grocery_store` | Grocery lists |
+| `update_grocery_item` / `request_order_approval` / `mark_grocery_ordered` | Fill the cart, get approval, record the order |
 
 ## Configuration
 
