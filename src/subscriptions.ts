@@ -3,6 +3,7 @@ import { config } from "./config.js";
 import type { Db, Tx } from "./db.js";
 import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
+import { enforce } from "./policy.js";
 import { balance, lockAccount, post, systemAccount } from "./ledger.js";
 import type { Tool } from "./registry.js";
 
@@ -91,6 +92,7 @@ export async function createPlan(db: Db, providerId: string, p: NewPlan): Promis
   if (!Number.isSafeInteger(p.priceCents) || p.priceCents <= 0) throw new AppError(400, "invalid_price", "priceCents must be a positive integer");
   if (!["week", "month", "year"].includes(p.interval)) throw new AppError(400, "invalid_interval", "interval must be week, month or year");
   if (!p.category?.trim()) throw new AppError(400, "invalid_category", "category is required");
+  enforce(p.slug, p.name, p.description, p.category, (p.features ?? []).join(" "));
   let toolId: string | null = null;
   if (p.toolSlug) {
     const { rows } = await db.query("SELECT id, pricing_type FROM tools WHERE slug = $1 AND provider_id = $2", [p.toolSlug, providerId]);
@@ -187,6 +189,7 @@ export async function requestSubscription(
 ) {
   const plan = await planBySlug(db, planSlug);
   if (!plan) throw new AppError(404, "unknown_plan", `no active plan named "${planSlug}"`);
+  enforce(plan.name, plan.description, plan.category);
   if (agentKey?.allowedToolSlugs && plan.toolSlug && !agentKey.allowedToolSlugs.includes(plan.toolSlug)) {
     throw new AppError(403, "tool_not_allowed", `this agent key may not use "${plan.toolSlug}", which the plan covers`);
   }
@@ -344,9 +347,11 @@ export type RenewalOutcome = { subscriptionId: string; outcome: "renewed" | "can
 /** Renew, cancel or mark past-due every subscription whose period has ended. Run periodically. */
 export async function renewDueSubscriptions(db: Db): Promise<RenewalOutcome[]> {
   const { rows } = await db.query(
-    `SELECT id FROM subscriptions
-      WHERE (status = 'active' AND current_period_end <= now())
-         OR (status = 'past_due' AND past_due_reason = 'insufficient_funds')`,
+    // A frozen owner's renewals wait until they unfreeze (the kill switch stops recurring charges too).
+    `SELECT s.id FROM subscriptions s JOIN users u ON u.id = s.user_id
+      WHERE u.frozen_at IS NULL
+        AND ((s.status = 'active' AND s.current_period_end <= now())
+          OR (s.status = 'past_due' AND s.past_due_reason = 'insufficient_funds'))`,
   );
   const outcomes: RenewalOutcome[] = [];
   for (const { id } of rows) {

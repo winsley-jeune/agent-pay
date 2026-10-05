@@ -1,6 +1,7 @@
 import type { Db, Tx } from "./db.js";
 import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
+import { enforce } from "./policy.js";
 import { createAccount } from "./ledger.js";
 
 export interface Provider {
@@ -76,6 +77,8 @@ export async function providerForUser(q: Db | Tx, userId: string, providerId: st
 }
 
 export async function createTool(db: Db, providerId: string, t: NewTool): Promise<Tool> {
+  // Agents can never pay for these, so they can't be listed either.
+  enforce(t.slug, t.name, t.description);
   if (!Number.isSafeInteger(t.priceCents) || t.priceCents < 0) {
     throw new AppError(400, "invalid_price", "priceCents must be a non-negative integer");
   }

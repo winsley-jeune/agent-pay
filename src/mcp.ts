@@ -47,12 +47,21 @@ const server = new McpServer(
       "add_subscription, import_bank_statement and savings_ideas. Those are billed by the merchant, not AgentPay. " +
       "Never cancel one without request_cancel first; the owner approves, then follow cancel_guide and record it with mark_canceled. " +
       "Price watch and groceries: read prices and fill carts only in the owner's own browser, never bypass a store's bot protection, " +
-      "never buy a watched item yourself, and never check out a grocery order until request_order_approval is approved and the checkout total is within the approved maximum. " +
+      "never buy a watched item without a buy mandate, and never check out a grocery order until request_order_approval is approved and the checkout total is within the approved maximum. " +
       "Before acting on any website, call check_browser_access for that site and action; if it isn't allowed, ask with request_browser_access and wait. " +
       "Only use sessions the owner is already signed in to: never type a password or sign-in code and never complete a sign-in; if a site asks you to sign in, stop and ask the owner to sign in themselves. " +
       "Never open payment settings, never read, copy or record card numbers or other payment details (not even the last four digits), and never change the payment method at checkout; " +
       "if checkout asks for payment details, stop and ask the owner. Record what you do with log_browser_activity. " +
-      "When a store shows several versions of an item, send what you see to pick_product and follow its choice unless it says ask_owner.",
+      "When a store shows several versions of an item, send what you see to pick_product and follow its choice unless it says ask_owner. " +
+      "Never buy, pay for, add to a cart or act on websites for: pornography or adult content, medicines (prescription or over the counter), pharmacies or medical devices, " +
+      "firearms, ammunition or weapons, controlled or illegal drugs, alcohol, tobacco or vaping, or gambling, even if the owner asks; tell the owner they have to do it themselves. " +
+      "When unsure, call check_purchase_policy first, and if in doubt, don't buy. " +
+      "Every agent has a level (get_balance): L0 asks before every paid call, L1 pays only what the owner's rules allow, L2 pays on its own within its limits. " +
+      "Money the owner set aside in an envelope pays matching calls without asking again; ask for one with request_envelope when a task needs many small payments. " +
+      "Pass reason and instruction to call_paid_tool and log_browser_activity: the owner's log keeps what they asked for, why you acted and what happened. " +
+      "If any result says frozen, stop everything and tell the owner; only they can unfreeze. " +
+      "Never buy a watched item unless check_buy_mandate says allowed for that price and site, right before checkout; then record the price with mark_bought. " +
+      "If you made a mistake that cost money, say so and record it with report_mistake.",
   },
 );
 
@@ -85,16 +94,22 @@ server.registerTool(
       input: z.record(z.string(), z.unknown()).default({}).describe("Input matching the tool's inputSchema"),
       idempotency_key: z.string().max(200).optional().describe("Stable key for this logical call; generated if omitted"),
       approval_id: z.string().optional().describe("From an earlier pending_approval result, once the owner has approved"),
+      reason: z.string().max(500).optional().describe("Why this call is needed; kept in the owner's log and shown if approval is needed"),
+      instruction: z.string().max(500).optional().describe("What the owner asked for that led to this call, in a sentence"),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  ({ tool, input, idempotency_key, approval_id }) =>
-    reply(api("POST", "/api/agent/call", { tool, input, idempotencyKey: idempotency_key ?? randomUUID(), approvalId: approval_id })),
+  ({ tool, input, idempotency_key, approval_id, reason, instruction }) =>
+    reply(api("POST", "/api/agent/call", { tool, input, idempotencyKey: idempotency_key ?? randomUUID(), approvalId: approval_id, reason, instruction })),
 );
 
 server.registerTool(
   "get_balance",
-  { title: "Wallet and budget", description: "Wallet balance, recent spend and this agent's limits.", annotations: { readOnlyHint: true } },
+  {
+    title: "Wallet, level and budget",
+    description: "Wallet balance, recent spend, this agent's limits and level (L0/L1/L2), its spending rules, envelopes it can use, and whether everything is frozen.",
+    annotations: { readOnlyHint: true },
+  },
   () => reply(api("GET", "/api/agent/balance")),
 );
 
@@ -393,10 +408,44 @@ server.registerTool(
 );
 
 server.registerTool(
+  "request_buy_mandate",
+  {
+    title: "Ask to buy a watched item when it drops",
+    description:
+      "Ask the owner to sign a buy mandate for a watched item: you may buy at most `quantity` at up to `max_price_cents` each, on the watched store, until it ends. " +
+      "They approve with their passkey. Without an active mandate, never buy a watched item.",
+    inputSchema: {
+      watch_id: z.string(),
+      max_price_cents: z.number().int().positive().optional().describe("Defaults to the watch's target price"),
+      quantity: z.number().int().min(1).max(10).optional(),
+      days: z.number().int().min(1).max(90).optional(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ watch_id, max_price_cents, quantity, days }) =>
+    reply(api("POST", pw(`/${encodeURIComponent(watch_id)}/mandate`), { maxPriceCents: max_price_cents, quantity, days })),
+);
+
+server.registerTool(
+  "check_buy_mandate",
+  {
+    title: "May I buy this now?",
+    description:
+      "Right before checking out a watched item, send the price you see and the store's site. Buy only if status is allowed, " +
+      "with the payment method the store already has selected, then call mark_bought with the price paid.",
+    inputSchema: { watch_id: z.string(), price_cents: z.number().int().positive(), site: z.string().describe("The store's site or the page URL") },
+    annotations: { readOnlyHint: true },
+  },
+  ({ watch_id, price_cents, site }) => reply(api("POST", pw(`/${encodeURIComponent(watch_id)}/check-mandate`), { priceCents: price_cents, site })),
+);
+
+server.registerTool(
   "mark_bought",
   {
-    title: "Record that the owner bought it",
-    description: "Stop watching because the owner bought the item. Never buy it yourself; the owner decides and checks out.",
+    title: "Record that it was bought",
+    description:
+      "Stop watching because the item was bought: by the owner, or by you under a buy mandate (check_buy_mandate said allowed). " +
+      "Give the price actually paid; a price above the mandate is recorded as an incident.",
     inputSchema: { watch_id: z.string(), price_cents: z.number().int().positive().optional() },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
@@ -563,21 +612,36 @@ server.registerTool(
     description:
       "Ask the owner for permission to use their already-signed-in session on a site for specific actions. They approve with their passkey. " +
       "Ask only for what the task needs (e.g. browse + add_to_cart to fill a cart; checkout_approved_order only when an order is approved).",
-    inputSchema: { site: z.string(), actions: z.array(browserAction).min(1), reason: z.string().max(300), days: z.number().int().min(1).max(365).optional() },
+    inputSchema: {
+      site: z.string(),
+      actions: z.array(browserAction).min(1),
+      reason: z.string().max(300),
+      purpose: z.string().max(200).optional().describe("What the permission is for, e.g. 'weekly groceries'; shown on the approval and kept with the permission"),
+      days: z.number().int().min(1).max(365).optional(),
+    },
     annotations: { readOnlyHint: false, destructiveHint: false },
   },
-  ({ site, actions, reason, days }) => reply(api("POST", pm("/request"), { site, actions, reason, days })),
+  ({ site, actions, reason, purpose, days }) => reply(api("POST", pm("/request"), { site, actions, reason, purpose, days })),
 );
 
 server.registerTool(
   "log_browser_activity",
   {
     title: "Record what you did on a site",
-    description: "Log each meaningful action (searched, added to cart, removed, checked out) so the owner can review it. Never include payment details.",
-    inputSchema: { site: z.string(), action: browserAction, summary: z.string().max(500) },
+    description:
+      "Log each meaningful action (searched, added to cart, removed, checked out) so the owner can review it: what you did, " +
+      "the owner's instruction it came from, why, and what happened. Never include payment details.",
+    inputSchema: {
+      site: z.string(),
+      action: browserAction,
+      summary: z.string().max(500),
+      instruction: z.string().max(500).optional().describe("What the owner asked for"),
+      reason: z.string().max(500).optional().describe("Why you did this"),
+      result: z.string().max(500).optional().describe("What happened"),
+    },
     annotations: { readOnlyHint: false, destructiveHint: false },
   },
-  ({ site, action, summary }) => reply(api("POST", pm("/activity"), { site, action, summary })),
+  ({ site, action, summary, instruction, reason, result }) => reply(api("POST", pm("/activity"), { site, action, summary, instruction, reason, result })),
 );
 
 server.registerTool(
@@ -629,6 +693,62 @@ server.registerTool(
         })),
       }),
     ),
+);
+
+// ---------------------------------------------------------------- owner controls
+
+const ctl = (path = "") => `/api/agent/controls${path}`;
+
+server.registerTool(
+  "check_purchase_policy",
+  {
+    title: "Is this something I must refuse?",
+    description:
+      "Check a product, service, tool or website against what agents must never buy or act on (adult content, medicines and pharmacies, weapons, " +
+      "controlled or illegal drugs, alcohol, tobacco, gambling). If allowed is false, refuse and tell the owner they have to do it themselves.",
+    inputSchema: { text: z.string().max(2000).optional().describe("Product or service name and description"), site: z.string().max(2000).optional() },
+    annotations: { readOnlyHint: true },
+  },
+  ({ text, site }) => (text || site ? reply(api("POST", ctl("/policy/check"), { text, site })) : fail("give text or site")),
+);
+
+server.registerTool(
+  "request_envelope",
+  {
+    title: "Ask the owner to set money aside",
+    description:
+      "Ask for an envelope: money moved out of the wallet for this agent, for some tools (or any), until a date. Calls it covers are paid without asking again; " +
+      "what's left returns to the wallet when it ends. The owner approves with their passkey.",
+    inputSchema: {
+      name: z.string().max(80).describe("e.g. 'Research this week'"),
+      amount_cents: z.number().int().positive(),
+      days: z.number().int().min(1).max(90).default(30),
+      purpose: z.string().max(300).optional(),
+      tool_slugs: z.array(z.string()).optional().describe("Only these tools; omit for any"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ name, amount_cents, days, purpose, tool_slugs }) =>
+    reply(api("POST", ctl("/envelopes"), { name, amountCents: amount_cents, days, purpose, toolSlugs: tool_slugs })),
+);
+
+server.registerTool(
+  "report_mistake",
+  {
+    title: "Report a mistake that cost money",
+    description:
+      "Record an incident when something you did cost the owner money it shouldn't have (wrong item, double order, went past a limit). " +
+      "Be honest and specific; the owner sees it with your log.",
+    inputSchema: {
+      description: z.string().max(2000),
+      kind: z.enum(["misjudgment", "condition_breach", "system_bug", "hijacked", "unclassified"]).optional()
+        .describe("misjudgment: a mistake within your authority; condition_breach: you went past a limit or condition; system_bug; hijacked: instructions came from someone else"),
+      amount_cents: z.number().int().nonnegative().optional(),
+      call_id: z.string().optional().describe("The callId of a paid call, if it was one"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ description, kind, amount_cents, call_id }) => reply(api("POST", ctl("/incidents"), { description, kind, amountCents: amount_cents, holdId: call_id })),
 );
 
 await server.connect(new StdioServerTransport());

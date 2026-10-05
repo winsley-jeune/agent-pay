@@ -5,8 +5,11 @@ import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
 import { balance, lockAccount, post, systemAccount } from "./ledger.js";
 import { createCallApproval } from "./approvals.js";
+import { audit } from "./audit.js";
+import { decideCall, frozenAt, frozenError, LEVEL_LABELS, listEnvelopes, lockEnvelopeFor } from "./controls.js";
 import { quote, toolById, toolBySlug, type Tool } from "./registry.js";
 import { findCoverage } from "./subscriptions.js";
+import { enforce } from "./policy.js";
 
 export interface CallRequest {
   tool: string;
@@ -14,6 +17,9 @@ export interface CallRequest {
   /** Same key + same agent = same call. Retrying never charges twice. */
   idempotencyKey: string;
   approvalId?: string;
+  /** Why the agent is making this call, and what the owner asked for. Kept in the owner's log. */
+  reason?: string;
+  instruction?: string;
 }
 
 export type CallResult =
@@ -28,7 +34,7 @@ export type CallResult =
       coveredBySubscription?: string;
     }
   | { status: "failed"; callId: string; chargedCents: 0; balanceCents: number; error: string; replayed: boolean }
-  | { status: "pending_approval"; approvalId: string; amountCents: number; approveUrl: string; message: string };
+  | { status: "pending_approval"; approvalId: string; amountCents: number; approveUrl: string; message: string; why: string };
 
 interface HoldRow {
   id: string;
@@ -76,7 +82,15 @@ async function spentSince(q: Db | Tx, agentKeyId: string, days: number): Promise
 
 export async function spendSummary(q: Db | Tx, agentKey: AgentKey) {
   const [last24h, last30d] = await Promise.all([spentSince(q, agentKey.id, 1), spentSince(q, agentKey.id, 30)]);
+  const envelopes = (await listEnvelopes(q, agentKey.userId)).filter((e) => e.status === "active" && (!e.agentKeyId || e.agentKeyId === agentKey.id));
   return {
+    frozen: (await frozenAt(q, agentKey.userId)) !== null,
+    level: agentKey.level,
+    levelLabel: LEVEL_LABELS[agentKey.level],
+    spendRules: agentKey.spendRules,
+    observeAboveCents: agentKey.observeAboveCents,
+    coolingOffUntil: agentKey.coolingOffUntil && new Date(agentKey.coolingOffUntil) > new Date() ? agentKey.coolingOffUntil : null,
+    envelopes: envelopes.map((e) => ({ id: e.id, name: e.name, purpose: e.purpose, toolSlugs: e.toolSlugs, balanceCents: e.balanceCents, expiresAt: e.expiresAt })),
     walletBalanceCents: await balance(q, agentKey.walletAccountId),
     spentLast24hCents: last24h,
     spentLast30dCents: last30d,
@@ -122,10 +136,14 @@ async function placeHold(
   tool: Tool,
   amountCents: number,
   req: CallRequest,
-  subscriptionId: string | null = null,
+  subscriptionId: string | null,
+  decision: { kind: "auto" | "observe" | "approved" | "covered"; reason: string; envelopeId: string | null },
 ): Promise<HoldRow> {
   return withTx(db, async (tx) => {
+    // Always the owner's wallet first, then any envelope: per-agent caps count holds from both.
     await lockAccount(tx, agentKey.walletAccountId);
+    if (await frozenAt(tx, agentKey.userId)) throw frozenError();
+    const funding = decision.envelopeId ? await lockEnvelopeFor(tx, agentKey, decision.envelopeId, tool, amountCents) : agentKey.walletAccountId;
 
     if (subscriptionId) {
       // Re-check quota under the wallet lock so parallel calls can't overspend it.
@@ -167,7 +185,7 @@ async function placeHold(
       }
     }
 
-    const available = await balance(tx, agentKey.walletAccountId);
+    const available = await balance(tx, funding);
     if (available < amountCents) {
       throw new AppError(402, "insufficient_funds", "not enough credits; ask the owner to top up", {
         balanceCents: available,
@@ -176,10 +194,12 @@ async function placeHold(
     }
 
     const { rows } = await tx.query(
-      `INSERT INTO holds (agent_key_id, wallet_account_id, tool_id, idempotency_key, amount_cents, expires_at, subscription_id)
-       VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7)
+      `INSERT INTO holds (agent_key_id, wallet_account_id, tool_id, idempotency_key, amount_cents, expires_at, subscription_id,
+                          decision, decision_reason, agent_reason)
+       VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9, $10)
        RETURNING ${holdColumns}`,
-      [agentKey.id, agentKey.walletAccountId, tool.id, req.idempotencyKey, amountCents, config.holdTtlSeconds, subscriptionId],
+      [agentKey.id, funding, tool.id, req.idempotencyKey, amountCents, config.holdTtlSeconds, subscriptionId,
+       decision.kind, decision.reason.slice(0, 300), req.reason?.slice(0, 500) ?? null],
     );
     const hold: HoldRow = rows[0];
     if (amountCents > 0) {
@@ -187,7 +207,7 @@ async function placeHold(
         tx,
         "hold",
         [
-          { accountId: agentKey.walletAccountId, amountCents: -amountCents },
+          { accountId: funding, amountCents: -amountCents },
           { accountId: await systemAccount(tx, "holds"), amountCents },
         ],
         `hold ${hold.id} for ${tool.slug}`,
@@ -299,14 +319,50 @@ async function callUpstream(tool: Tool, callId: string, input: unknown, fetchImp
 }
 
 /**
- * The paid call: quote → budget checks → hold → upstream → capture or release.
- * Every path that places a hold settles it before returning.
+ * The paid call: quote → decision (level, rules, envelope) → hold → upstream →
+ * capture or release. Every path that places a hold settles it before
+ * returning. Each outcome is written to the owner's "why" log.
  */
 export async function callPaidTool(db: Db, agentKey: AgentKey, req: CallRequest, opts: GatewayOptions = {}): Promise<CallResult> {
+  let result: CallResult;
+  try {
+    result = await runPaidCall(db, agentKey, req, opts);
+  } catch (err) {
+    if (err instanceof AppError && err.status !== 400) {
+      await logCall(agentKey, req, "call_refused", `Refused a call to ${req.tool}`, err.message, { code: err.code, ...(err.details as object) }, db);
+    }
+    throw err;
+  }
+  if (result.status === "pending_approval") {
+    await logCall(agentKey, req, "call_needs_approval", `Asked the owner to approve ${usd(result.amountCents)} for ${req.tool}`, result.why, { approvalId: result.approvalId }, db);
+  } else if (!result.replayed) {
+    const summary = result.status === "ok" ? `Paid ${usd(result.chargedCents)} for ${req.tool}` : `Call to ${req.tool} failed; not charged`;
+    await logCall(agentKey, req, result.status === "ok" ? "call_paid" : "call_failed", summary, result.status === "ok" ? null : result.error, { callId: result.callId }, db);
+  }
+  return result;
+}
+
+const usd = (c: number) => `$${(c / 100).toFixed(2)}`;
+
+async function logCall(agentKey: AgentKey, req: CallRequest, kind: string, summary: string, result: string | null, data: Record<string, unknown>, db: Db) {
+  const reason = req.reason ?? null;
+  if (kind === "call_paid" && data.callId) {
+    const { rows } = await db.query(`SELECT decision, decision_reason AS "decisionReason" FROM holds WHERE id = $1`, [data.callId]);
+    if (rows[0]) data = { ...data, decision: rows[0].decision, decidedBecause: rows[0].decisionReason };
+  }
+  // The money has already moved; a failure to log must not turn a paid call into an error.
+  await audit(db, agentKey.userId, { actor: "agent", agentKeyId: agentKey.id, kind, summary, instruction: req.instruction, reason, result, data }).catch((err) =>
+    console.error("audit log write failed", err),
+  );
+}
+
+async function runPaidCall(db: Db, agentKey: AgentKey, req: CallRequest, opts: GatewayOptions): Promise<CallResult> {
   if (!req.idempotencyKey || req.idempotencyKey.length > 200) {
     throw new AppError(400, "invalid_idempotency_key", "idempotencyKey is required (max 200 chars)");
   }
+  if (await frozenAt(db, agentKey.userId)) throw frozenError();
   const tool = await getToolForAgent(db, agentKey, req.tool);
+  enforce(tool.slug, tool.name, tool.description);
 
   const existing = await holdByKey(db, agentKey.id, req.idempotencyKey);
   if (existing) return replay(db, existing, tool.id);
@@ -322,22 +378,32 @@ export async function callPaidTool(db: Db, agentKey: AgentKey, req: CallRequest,
     });
   }
 
-  if (!coverage && agentKey.approvalThresholdCents !== null && amountCents > agentKey.approvalThresholdCents && !req.approvalId) {
-    const approvalId = await createCallApproval(db, agentKey, tool, amountCents, req.input);
-    return {
-      status: "pending_approval",
-      approvalId,
-      amountCents,
-      approveUrl: `${config.publicUrl}/#approvals`,
-      message:
-        `This call costs ${amountCents}c, above the owner's approval threshold. ` +
-        `Ask the owner to approve it with their passkey, then retry with the same input and approvalId "${approvalId}".`,
-    };
+  let decision: Parameters<typeof placeHold>[6];
+  if (coverage) {
+    decision = { kind: "covered", reason: "included in a subscription", envelopeId: null };
+  } else if (req.approvalId) {
+    decision = { kind: "approved", reason: "approved by the owner with a passkey", envelopeId: null };
+  } else {
+    const d = await decideCall(db, agentKey, tool, amountCents);
+    if (d.outcome === "approve") {
+      const approvalId = await createCallApproval(db, agentKey, tool, amountCents, req.input, { why: d.reason, agentReason: req.reason });
+      return {
+        status: "pending_approval",
+        approvalId,
+        amountCents,
+        approveUrl: `${config.publicUrl}/#approvals`,
+        why: d.reason,
+        message:
+          `This call costs ${amountCents}c and needs the owner's approval (${d.reason}). ` +
+          `Ask the owner to approve it with their passkey, then retry with the same input and approvalId "${approvalId}".`,
+      };
+    }
+    decision = { kind: d.outcome, reason: d.reason, envelopeId: d.envelopeId };
   }
 
   let hold: HoldRow;
   try {
-    hold = await placeHold(db, agentKey, tool, amountCents, { ...req, approvalId: coverage ? undefined : req.approvalId }, coverage?.subscriptionId ?? null);
+    hold = await placeHold(db, agentKey, tool, amountCents, { ...req, approvalId: coverage ? undefined : req.approvalId }, coverage?.subscriptionId ?? null, decision);
   } catch (err: any) {
     // Lost a race with a concurrent call using the same idempotency key.
     if (err?.code === "23505") {

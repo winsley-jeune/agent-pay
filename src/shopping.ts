@@ -1,5 +1,6 @@
 import type { Db, Tx } from "./db.js";
 import { AppError } from "./errors.js";
+import { refusalMessage, screen } from "./policy.js";
 
 // Choosing a product when a store shows many versions of one list item
 // ("carrots": 1 lb, 2 lb, 5 lb, baby, organic, shredded, carrot cake...).
@@ -172,6 +173,8 @@ export function pickProduct(item: ListItemInput, prefs: Preferences, memory: Mem
     const fromMemory = !!memory && ((!!memory.productUrl && c.url === memory.productUrl) || itemKey(c.name) === memoryKey);
     const skip = (reason: string) => skipped.push({ index, name: c.name, reason });
 
+    const refused = screen(`${c.name} ${c.brand ?? ""}`) ?? screen(item.name);
+    if (refused) return skip(refusalMessage(refused));
     if (c.inStock === false) return skip("out of stock");
     if (!Number.isSafeInteger(c.priceCents) || c.priceCents <= 0) return skip("no price");
     if (has(prefs.brandsAvoid, c.brand)) return skip(`brand ${c.brand} is on your avoid list`);

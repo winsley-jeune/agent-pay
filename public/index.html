@@ -49,6 +49,11 @@
   #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 8px; display: none; max-width: calc(100% - 32px); z-index: 5; }
   .login { max-width: 420px; margin: 60px auto; }
   .suggestion { border-left: 3px solid var(--accent); padding-left: 10px; margin: 8px 0; }
+  button.kill { background: var(--bad); border-color: var(--bad); color: #fff; font-weight: 650; padding: 10px 18px; }
+  .terms { border: 1px solid var(--warn); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
+  .terms ul { margin: 4px 0 0; padding-left: 18px; }
+  .rule input { width: 120px; }
+  s.refused { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -67,7 +72,7 @@ const date = (d) => (d ? new Date(d).toLocaleString() : "");
 let token = null;
 try { token = localStorage.getItem("agentpay.token"); } catch {}
 let me = null;
-let tab = location.hash.slice(1) || "all";
+let tab = location.hash.slice(1) || "board";
 
 function toast(msg) {
   const t = $("#toast"); t.textContent = msg; t.style.display = "block";
@@ -107,7 +112,7 @@ function renderLogin() {
 }
 
 // ------------------------------------------------------------------ shell
-const tabs = [["all", "All subscriptions"], ["watch", "Price watch"], ["grocery", "Groceries"], ["perms", "Permissions"], ["wallet", "Wallet"], ["approvals", "Approvals"], ["subscriptions", "Agent plans"], ["agents", "Agent keys"], ["security", "Passkeys"], ["provider", "Sell tools"]];
+const tabs = [["board", "Control"], ["all", "All subscriptions"], ["watch", "Price watch"], ["grocery", "Groceries"], ["perms", "Permissions"], ["wallet", "Wallet"], ["approvals", "Approvals"], ["subscriptions", "Agent plans"], ["agents", "Agent keys"], ["security", "Passkeys"], ["provider", "Sell tools"]];
 
 async function boot() {
   if (!token) return renderLogin();
@@ -124,10 +129,10 @@ async function boot() {
   if (params.get("topup") === "cancelled") toast("Top-up cancelled.");
   show(tab);
   refreshCounts();
-  setInterval(refreshCounts, 15000);
+  setInterval(refreshCounts, 60000);
 }
 
-window.addEventListener("hashchange", () => token && me && show(location.hash.slice(1) || "all"));
+window.addEventListener("hashchange", () => token && me && show(location.hash.slice(1) || "board"));
 
 async function refreshCounts() {
   try {
@@ -135,14 +140,153 @@ async function refreshCounts() {
     $("#bal").innerHTML = `<span class="muted small">Balance</span> <b>${usd(me.balanceCents)}</b>`;
     const { approvals } = await api("GET", "/api/approvals?status=pending");
     $("#count-approvals").innerHTML = approvals.length ? `<span class="count">${approvals.length}</span>` : "";
+    const b = await api("GET", "/api/controls/board");
+    const n = b.toReview.length + b.openIncidents.length;
+    $("#count-board").innerHTML = b.frozenAt ? `<span class="count">frozen</span>` : n ? `<span class="count">${n}</span>` : "";
   } catch {}
 }
 
 function show(name) {
-  tab = tabs.some(([k]) => k === name) ? name : "all";
+  tab = tabs.some(([k]) => k === name) ? name : "board";
   document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.tab === tab));
   document.querySelectorAll("main section").forEach((s) => s.classList.toggle("active", s.id === "tab-" + tab));
-  ({ all, watch, grocery, perms, wallet, approvals, subscriptions, agents, security, provider })[tab]().catch((e) => toast(e.message));
+  ({ board, all, watch, grocery, perms, wallet, approvals, subscriptions, agents, security, provider })[tab]().catch((e) => toast(e.message));
+}
+
+// ------------------------------------------------------------------ control board
+const incidentKinds = [["misjudgment", "Agent misjudged"], ["condition_breach", "Broke my conditions"], ["system_bug", "AgentPay bug"], ["hijacked", "Agent was hijacked"], ["unclassified", "Not sure yet"]];
+const stateChip = (s) => `<span class="chip ${["active", "watching"].includes(s) ? "ok" : ["pending", "requested", "waiting", "trial", "cancel_requested", "pending_approval"].includes(s) ? "warn" : ""}">${esc(String(s).replaceAll("_", " "))}</span>`;
+const stopBtn = (s, label = "Stop", confirmText = "") => `<button class="danger" data-stop-m="${esc(s.method)}" data-stop-p="${esc(s.path)}"${confirmText ? ` data-confirm="${esc(confirmText)}"` : ""}>${label}</button>`;
+const group = (title, head, rows, empty) => `<h3 style="margin-top:14px">${title}</h3><div class="table-wrap"><table><tr>${head.map((h) => `<th>${h}</th>`).join("")}<th></th></tr>
+  ${rows.join("") || `<tr><td colspan="${head.length + 1}" class="muted small">${empty}</td></tr>`}</table></div>`;
+
+async function board() {
+  const el = $("#tab-board");
+  const [b, guarantee, policy, { entries }] = await Promise.all([api("GET", "/api/controls/board"), api("GET", "/api/controls/guarantee"),
+    api("GET", "/api/controls/policy"), api("GET", "/api/controls/audit")]);
+  const lim = (l) => [l.perCallMaxCents != null && `${usd(l.perCallMaxCents)}/call`, l.dailyCapCents != null && `${usd(l.dailyCapCents)}/24h`,
+    l.monthlyCapCents != null && `${usd(l.monthlyCapCents)}/30d`, l.approvalThresholdCents != null && `asks above ${usd(l.approvalThresholdCents)}`].filter(Boolean).join(" · ") || "no limits";
+  el.innerHTML = `
+    <div class="card" style="border:2px solid var(--bad)">
+      ${b.frozenAt ? `<div class="spread"><div><h3 style="color:var(--bad)">Frozen since ${date(b.frozenAt)}</h3>
+          <p class="small">No agent can spend, AgentPay renewals are paused and pending approvals were declined. Unfreezing needs your passkey.</p></div>
+          <button class="primary" id="unfreeze">Unfreeze…</button></div>`
+        : `<div class="spread"><div><h3>Kill switch</h3><p class="small muted">Stops every agent at once, declines all pending approvals and pauses AgentPay renewals. No passkey needed; unfreezing later does need one.</p></div>
+          <button class="kill" id="freeze">Freeze everything</button></div>`}
+    </div>
+    ${b.toReview.length ? `<div class="card"><h3>To review</h3><p class="small muted">These calls went through on their own but were flagged for you to look at.</p><div class="table-wrap"><table>
+      <tr><th>Call</th><th class="num">Amount</th><th>Why flagged</th><th></th></tr>
+      ${b.toReview.map((c) => `<tr><td><b>${esc(c.tool)}</b><div class="small muted">${esc(c.agentKeyName)} · ${date(c.createdAt)}</div>${c.agentReason ? `<div class="small">Agent's reason: “${esc(c.agentReason)}”</div>` : ""}</td>
+        <td class="num">${usd(c.amountCents)}</td><td class="small">${esc(c.decidedBecause ?? "")}</td>
+        <td class="row"><button data-review-ok="${esc(c.id)}">Looks right</button><button class="danger" data-review-bad="${esc(c.id)}">Report problem</button></td></tr>`).join("")}
+    </table></div></div>` : ""}
+    ${b.reminders.length ? `<div class="card"><h3>Coming up</h3>${b.reminders.map((r) => `<div class="suggestion spread" style="border-color:var(--warn)"><div>${esc(r.message)}<div class="small muted">${esc(r.on)} · ${r.daysLeft} days</div></div>
+      <div class="row">${r.actions.includes("request_cancel") ? `<button data-rcancel="${esc(r.subscriptionId)}">Cancel…</button>` : ""}${r.actions.includes("accept_price") ? `<button data-accept="${esc(r.subscriptionId)}">Keep new price</button>` : ""}</div></div>`).join("")}</div>` : ""}
+    <div class="card"><h3>Everything that can spend your money</h3>
+      <p class="small muted">${b.pendingApprovals ? `<a href="#approvals">${b.pendingApprovals} waiting for approval</a> · ` : ""}Subscriptions ${usd(b.subscriptionTotals.monthlyCents)}/month (${usd(b.subscriptionTotals.yearlyCents)} a year)</p>
+      ${group("Agents", ["Agent", "Level", "Spent", "Limits"], b.agents.map((a) => `<tr><td><b>${esc(a.name)}</b>${a.coolingOffUntil ? `<div class="small" style="color:var(--warn)">cooling off until ${date(a.coolingOffUntil)}</div>` : ""}</td>
+        <td><span class="chip">${esc(a.levelLabel ?? a.level)}</span></td><td class="small">${usd(a.spentLast24hCents)} in 24h<br>${usd(a.spentLast30dCents)} in 30 days</td>
+        <td class="small">${lim(a.limits)}${a.spendRules?.length ? `<br>${a.spendRules.length} spend rule${a.spendRules.length > 1 ? "s" : ""}` : ""}${a.observeAboveCents != null ? `<br>flags above ${usd(a.observeAboveCents)}` : ""}</td>
+        <td>${stopBtn(a.stop, "Revoke", `Revoke the agent key "${a.name}"? The agent stops working immediately and the key can't be restored.`)}</td></tr>`), "No active agent keys.")}
+      ${group("Envelopes", ["Envelope", "Left", "Status", "Ends"], b.envelopes.map((e) => `<tr><td><b>${esc(e.name)}</b><div class="small muted">${esc(e.purpose ?? "")}${e.agentKeyName ? " · " + esc(e.agentKeyName) : " · any agent"}${e.toolSlugs?.length ? " · " + esc(e.toolSlugs.join(", ")) : ""}</div></td>
+        <td class="num">${usd(e.balanceCents)} <span class="small muted">of ${usd(e.amountCents)}</span></td><td>${stateChip(e.status)}</td><td class="small">${date(e.expiresAt)}</td>
+        <td>${stopBtn(e.stop, "Close")}</td></tr>`), "No envelopes.")}
+      ${group("Browser permissions", ["Site", "Allowed to", "Until"], b.browserPermissions.map((g) => `<tr><td><b>${esc(g.site)}</b><div class="small muted">${esc(g.purpose ?? "")}${g.agentKeyName ? " · " + esc(g.agentKeyName) : ""}</div></td>
+        <td class="small">${g.actions.map((a) => esc(actionLabels[a] ?? a)).join(", ")}</td><td class="small">${date(g.expiresAt)}</td><td>${stopBtn(g.stop, "Revoke")}</td></tr>`), "No sites allowed.")}
+      ${group("Buy mandates", ["Item", "Up to", "State", "Until"], b.buyMandates.map((m) => `<tr><td><b>${esc(m.title)}</b><div class="small muted">${esc(m.site)}</div></td>
+        <td class="num">${usd(m.maxPriceCents)} × ${esc(m.quantity)}</td><td>${stateChip(m.state)}</td><td class="small">${date(m.expiresAt)}</td><td>${m.state === "active" ? stopBtn(m.stop, "Revoke") : ""}</td></tr>`), "No agent may buy anything for you.")}
+      ${group("Subscriptions", ["Subscription", "Price", "Status", "Next charge"], b.subscriptions.map((s) => `<tr><td><b>${esc(s.name)}</b><div class="small muted">${s.kind === "agentpay" ? "AgentPay wallet" : "billed by the merchant"}</div></td>
+        <td class="num">${usd(s.priceCents)}/${esc(s.interval)}</td><td>${stateChip(s.status)}</td><td class="small">${esc(s.nextRenewalOn ?? "")}</td>
+        <td>${s.kind === "external" ? stopBtn(s.stop, "Cancel…") : stopBtn(s.stop, "Cancel")}</td></tr>`), "No subscriptions.")}
+    </div>
+    <div class="card"><h3>Envelopes</h3>
+      <p class="small muted">Set money aside for one job. An agent can only spend what's in the envelope, and it closes on its own when time runs out. Creating one needs your passkey.</p>
+      <div class="grid" id="newenv">
+        <label>Name<input name="name" placeholder="Trip research"></label>
+        <label>Amount ($)<input name="amount" type="number" step="0.01" min="0.01"></label>
+        <label>Days (1-90)<input name="days" type="number" min="1" max="90" value="30"></label>
+        <label>Purpose<input name="purpose" placeholder="optional"></label>
+        <label>Agent<select name="agent"><option value="">Any agent</option>${b.agents.map((a) => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join("")}</select></label>
+        <label>Tools<input name="tools" placeholder="all tools (or comma-separated)"></label>
+      </div><div class="row" style="margin-top:8px"><button class="primary" id="addenv">Create envelope</button></div>
+    </div>
+    <div class="card"><h3>Vault</h3>
+      <div class="spread"><div><div class="muted small">Locked away from agents</div><div class="big">${usd(b.vault.balanceCents)}</div>
+        <div class="small muted">Unlocking needs your passkey and then waits ${esc(b.vault.unlockDelayHours)} hours.</div></div>
+        <div class="row"><input id="vamt" type="number" step="0.01" min="0.01" placeholder="Amount ($)" style="width:130px"><button id="vlock">Lock in vault</button><button id="vunlock">Unlock…</button></div></div>
+      ${b.vault.unlocks.length ? `<table style="margin-top:8px">${b.vault.unlocks.map((u) => `<tr><td class="num">${usd(u.amountCents)}</td><td>${stateChip(u.status)}</td>
+        <td class="small">${u.availableAt ? "available " + date(u.availableAt) : "waiting for your approval"}</td><td><button class="danger" data-vcancel="${esc(u.id)}">Cancel</button></td></tr>`).join("")}</table>` : ""}
+    </div>
+    <div class="card"><div class="spread"><h3>Incidents</h3><button id="report">Report an incident</button></div><div class="table-wrap"><table>
+      ${b.openIncidents.map((i) => `<tr><td>${esc(i.description)}<div class="small muted">${i.agentKeyName ? esc(i.agentKeyName) + " · " : ""}${i.amountCents != null ? usd(i.amountCents) : ""}</div>
+          <div class="small">${i.guarantee?.eligible ? `<span class="chip ok">covered up to ${usd(i.guarantee.upToCents)}</span> ` : ""}${esc(i.guarantee?.why ?? "")}</div></td>
+        <td><select data-kind="${esc(i.id)}">${incidentKinds.map(([k, l]) => `<option value="${k}" ${k === i.kind ? "selected" : ""}>${l}</option>`).join("")}</select></td>
+        <td><button data-resolve="${esc(i.id)}">Resolved</button></td></tr>`).join("") || `<tr><td class="muted small">No open incidents.</td></tr>`}
+    </table></div>
+      <details style="margin-top:8px"><summary class="small muted">${guarantee.offered ? "Our guarantee" : "What we cover"}</summary>${guarantee.text.map((t) => `<p class="small">${esc(t)}</p>`).join("")}</details>
+    </div>
+    <div class="card"><div class="spread"><h3>Why log</h3><button id="verify">Verify chain</button></div><div id="verifyres"></div>
+      <p class="small muted">Every action, who took it, on whose instruction and why. Entries are chained so they can't be changed afterwards.</p>
+      <div class="table-wrap" style="max-height:420px;overflow-y:auto"><table><tr><th>#</th><th>When</th><th>Who</th><th>What</th></tr>
+      ${[...entries].sort((x, y) => y.seq - x.seq).slice(0, 200).map((e) => `<tr><td class="small muted">${esc(e.seq)}</td><td class="small muted">${date(e.createdAt)}</td>
+        <td class="small">${esc(e.agentKeyName || e.actor)}</td><td><span class="chip">${esc(e.kind)}</span> ${esc(e.summary)}
+        ${e.instruction ? `<div class="small muted">Instruction: ${esc(e.instruction)}</div>` : ""}${e.reason ? `<div class="small muted">Why: ${esc(e.reason)}</div>` : ""}${e.result ? `<div class="small muted">Result: ${esc(e.result)}</div>` : ""}</td></tr>`).join("") || `<tr><td colspan="4" class="muted small">Nothing yet.</td></tr>`}
+      </table></div></div>
+    <div class="card"><h3>What agents must refuse</h3>
+      <p class="small muted">Agents won't buy these, whatever their limits. This can't be turned off; buy these yourself.</p>
+      <div class="row">${policy.refused.map((r) => `<span class="chip bad">${esc(r.label)}</span>`).join("")}</div>
+      ${policy.note ? `<p class="small muted">${esc(policy.note)}</p>` : ""}
+    </div>`;
+
+  const on = (sel, fn) => $(sel) && ($(sel).onclick = act(fn));
+  const passkeyThen = async (approvalId, msg) => { if (await approveWithPasskey(approvalId)) toast(msg); await refreshCounts(); board(); };
+  const cancelMsg = "Cancellation approved. Follow the steps under All subscriptions › How to cancel.";
+  on("#freeze", async () => { const r = await api("POST", "/api/controls/freeze", {}); toast(`Frozen. ${r.declined ?? 0} pending approval${r.declined === 1 ? "" : "s"} declined.`); await refreshCounts(); board(); });
+  on("#unfreeze", async () => passkeyThen((await api("POST", "/api/controls/unfreeze", {})).approvalId, "Unfrozen. Agents can spend again within their limits."));
+  el.querySelectorAll("[data-stop-p]").forEach((btn) => (btn.onclick = act(async () => {
+    if (btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
+    const m = btn.dataset.stopM;
+    const r = await api(m, btn.dataset.stopP, m === "POST" ? {} : undefined);
+    if (r?.approvalId) return passkeyThen(r.approvalId, cancelMsg);
+    toast("Stopped."); await refreshCounts(); board();
+  })));
+  el.querySelectorAll("[data-review-ok]").forEach((btn) => (btn.onclick = act(async () => { await api("POST", `/api/controls/reviews/${btn.dataset.reviewOk}`, { ok: true }); await refreshCounts(); board(); })));
+  el.querySelectorAll("[data-review-bad]").forEach((btn) => (btn.onclick = act(async () => {
+    const description = prompt("What went wrong?");
+    if (description == null) return;
+    await api("POST", `/api/controls/reviews/${btn.dataset.reviewBad}`, { ok: false, description: description || undefined });
+    toast("Reported. It's listed under Incidents."); await refreshCounts(); board();
+  })));
+  el.querySelectorAll("[data-rcancel]").forEach((btn) => (btn.onclick = act(async () => passkeyThen((await api("POST", `/api/everyday/${btn.dataset.rcancel}/request-cancel`, {})).approvalId, cancelMsg))));
+  el.querySelectorAll("[data-accept]").forEach((btn) => (btn.onclick = act(async () => { await api("POST", `/api/everyday/${btn.dataset.accept}/accept-price`, {}); toast("Keeping it at the new price."); board(); })));
+  on("#addenv", async () => {
+    const f = (n) => $(`#newenv [name=${n}]`).value.trim();
+    const { approvalId } = await api("POST", "/api/controls/envelopes", { name: f("name"), amountCents: toCents(f("amount")), days: Number(f("days")) || 30,
+      purpose: f("purpose") || undefined, agentKeyId: f("agent") || null, toolSlugs: f("tools") ? f("tools").split(/[\s,]+/).filter(Boolean) : null });
+    await passkeyThen(approvalId, "Envelope ready.");
+  });
+  on("#vlock", async () => { await api("POST", "/api/controls/vault/lock", { amountCents: toCents($("#vamt").value) }); toast("Locked in the vault."); await refreshCounts(); board(); });
+  on("#vunlock", async () => passkeyThen((await api("POST", "/api/controls/vault/unlock", { amountCents: toCents($("#vamt").value) })).approvalId,
+    `Unlock approved. The money is available after ${b.vault.unlockDelayHours} hours.`));
+  el.querySelectorAll("[data-vcancel]").forEach((btn) => (btn.onclick = act(async () => { await api("POST", `/api/controls/vault/unlocks/${btn.dataset.vcancel}/cancel`, {}); board(); })));
+  el.querySelectorAll("[data-kind]").forEach((s) => (s.onchange = act(async () => { await api("PATCH", `/api/controls/incidents/${s.dataset.kind}`, { kind: s.value }); board(); })));
+  el.querySelectorAll("[data-resolve]").forEach((btn) => (btn.onclick = act(async () => {
+    const resolution = prompt("How was it resolved?");
+    if (resolution == null) return;
+    await api("PATCH", `/api/controls/incidents/${btn.dataset.resolve}`, { resolved: true, resolution: resolution || undefined }); await refreshCounts(); board();
+  })));
+  on("#report", async () => {
+    const description = prompt("What happened?");
+    if (!description) return;
+    const amount = prompt("How much money was involved ($)? Leave blank if none.");
+    await api("POST", "/api/controls/incidents", { description, amountCents: toCents(amount?.trim()) ?? undefined });
+    toast("Reported."); await refreshCounts(); board();
+  });
+  on("#verify", async () => {
+    const v = await api("GET", "/api/controls/audit/verify");
+    $("#verifyres").innerHTML = v.ok ? `<p class="small"><span class="chip ok">intact</span> All ${esc(v.entries)} entries check out.</p>`
+      : `<p class="small" style="color:var(--bad)">Chain broken${v.brokenAt != null ? ` at entry ${esc(v.brokenAt)}` : ""}: ${esc(v.problem ?? "unknown problem")}</p>`;
+  });
 }
 
 // ------------------------------------------------------------------ all subscriptions
@@ -278,6 +422,7 @@ async function watch() {
   const { watches, saleEvents } = await api("GET", "/api/price-watch?all=1");
   const live = watches.filter((w) => w.status === "watching" || w.status === "target_hit");
   const ended = watches.filter((w) => w.status === "bought" || w.status === "stopped");
+  const mandates = Object.fromEntries(await Promise.all(live.map(async (w) => [w.id, (await api("GET", `/api/price-watch/${w.id}/mandates`)).mandates])));
   const chip = { watching: ["watching", ""], target_hit: ["target reached", "ok"], bought: ["bought", "ok"], stopped: ["stopped", "bad"] };
   el.innerHTML = `
     <div class="card"><h3>Upcoming sales</h3><div class="row">${saleEvents.map((e) => `<span class="chip">${esc(e.name)}: ${e.date ? `${esc(e.date)} (${e.daysAway} days)` : esc(e.window)}</span>`).join("")}</div></div>
@@ -296,8 +441,11 @@ async function watch() {
       <div class="row" style="margin-top:8px">
         <input type="number" step="0.01" min="0.01" placeholder="Price you see ($)" data-price-input="${w.id}" style="width:150px"><button data-price="${w.id}">Record price</button>
         <input type="number" step="0.01" min="0.01" placeholder="New target ($)" data-target-input="${w.id}" style="width:140px"><button data-target="${w.id}">Change target</button>
-        <button class="primary" data-bought="${w.id}">I bought it</button><button class="danger" data-stop="${w.id}">Stop</button>
-      </div></div>`).join("") || `<div class="card muted">Not watching anything yet.</div>`}
+        <button class="primary" data-bought="${w.id}">I bought it</button><button data-mandate="${w.id}">Let agent buy…</button><button class="danger" data-stop="${w.id}">Stop</button>
+      </div>
+      ${mandates[w.id]?.length ? `<table style="margin-top:8px">${mandates[w.id].map((m) => `<tr><td class="small">Agent may buy on ${esc(m.site)}</td><td class="num">up to ${usd(m.maxPriceCents)} × ${esc(m.quantity)}</td>
+        <td>${stateChip(m.state)}</td><td>${m.state === "active" ? `<button class="danger" data-unmandate="${esc(m.id)}">Revoke</button>` : ""}</td></tr>`).join("")}</table>` : ""}
+      </div>`).join("") || `<div class="card muted">Not watching anything yet.</div>`}
     <div class="card"><h3>Watch an item</h3>
       <p class="small muted">Paste a product link and the price you want to pay. Your agent checks the price in your own browser and records it; AgentPay never signs in to the store or buys for you.</p>
       <div class="grid" id="newwatch">
@@ -325,13 +473,23 @@ async function watch() {
   })));
   el.querySelectorAll("[data-bought]").forEach((b) => (b.onclick = act(async () => { await api("POST", `/api/price-watch/${b.dataset.bought}/bought`, {}); toast("Nice. Marked as bought."); watch(); })));
   el.querySelectorAll("[data-stop]").forEach((b) => (b.onclick = act(async () => { await api("POST", `/api/price-watch/${b.dataset.stop}/stop`, {}); watch(); })));
+  el.querySelectorAll("[data-mandate]").forEach((b) => (b.onclick = act(async () => {
+    const max = prompt("Highest price the agent may pay, per item ($)?");
+    if (!max) return;
+    const qty = Number(prompt("How many?", "1"));
+    if (!qty) return;
+    const { approvalId } = await api("POST", `/api/price-watch/${b.dataset.mandate}/mandate`, { maxPriceCents: toCents(max.trim()), quantity: qty, days: 30 });
+    if (await approveWithPasskey(approvalId)) toast("Your agent may buy it at or below that price for 30 days.");
+    await refreshCounts(); watch();
+  })));
+  el.querySelectorAll("[data-unmandate]").forEach((b) => (b.onclick = act(async () => { await api("DELETE", `/api/price-watch/mandates/${b.dataset.unmandate}`); toast("Revoked."); watch(); })));
 }
 
 // ------------------------------------------------------------------ groceries
 const storeNames = { walmart: "Walmart", whole_foods: "Whole Foods" };
 const listStatus = { draft: ["draft", ""], shopping: ["agent is shopping", "warn"], ready: ["waiting for your approval", "warn"], approved: ["approved, agent can check out", "ok"],
   ordered: ["ordered", "ok"], canceled: ["cancelled", "bad"] };
-const itemStatus = { needed: ["to find", ""], in_cart: ["in cart", "ok"], substituted: ["swapped", "warn"], unavailable: ["unavailable", "bad"], removed: ["removed", "bad"] };
+const itemStatus = { needed: ["to find", ""], in_cart: ["in cart", "ok"], substituted: ["swapped", "warn"], unavailable: ["unavailable", "bad"], removed: ["removed", "bad"], refused: ["buy it yourself", "bad"] };
 
 /** Shrink a phone photo to at most 1600px on the long side, as JPEG, before uploading. */
 async function photoToBase64(file) {
@@ -410,7 +568,10 @@ function groceryDetail(l) {
         ${l.approvedMaxCents ? `<div class="small muted">approved up to ${usd(l.approvedMaxCents)}</div>` : ""}</div></div>
     <div class="table-wrap"><table><tr><th>Item</th><th>In the cart</th><th class="num">Price</th><th>Status</th><th></th></tr>
       ${l.items.map((i) => {
-        const [s, c] = itemStatus[i.status];
+        const [s, c] = itemStatus[i.status] ?? [i.status, ""];
+        if (i.status === "refused") return `<tr><td><s class="refused"><b>${esc(i.name)}</b></s><div class="small muted">${[i.quantity ? `${i.quantity}${i.unit ? " " + esc(i.unit) : ""}` : "", esc(i.notes ?? "")].filter(Boolean).join(" · ")}</div></td>
+          <td class="small" colspan="2" style="color:var(--bad)">${esc(i.substituteNote ?? "Agents can't buy this.")}</td><td><span class="chip ${c}">${s}</span></td>
+          <td>${editable ? `<button class="small" data-gstatus="removed" data-item="${i.id}">Remove</button>` : ""}</td></tr>`;
         return `<tr><td><b>${esc(i.name)}</b><div class="small muted">${[i.quantity ? `${i.quantity}${i.unit ? " " + esc(i.unit) : ""}` : "", esc(i.notes ?? "")].filter(Boolean).join(" · ")}</div></td>
           <td class="small">${i.productUrl ? `<a href="${esc(i.productUrl)}" target="_blank" rel="noopener">${esc(i.productName ?? "product")}</a>` : esc(i.productName ?? "")}
             ${i.substituteNote ? `<div style="color:var(--warn)">${esc(i.substituteNote)}</div>` : ""}${!i.productName && i.searchUrl ? `<a href="${esc(i.searchUrl)}" target="_blank" rel="noopener">search</a>` : ""}</td>
@@ -432,7 +593,7 @@ function groceryDetail(l) {
 
 // ------------------------------------------------------------------ permissions
 const actionLabels = { browse: "browse", add_to_cart: "fill the cart", checkout_approved_order: "check out approved orders", manage_subscription: "manage subscriptions" };
-const grantState = { active: "ok", pending: "warn", expired: "bad", revoked: "bad", denied: "bad" };
+const grantState = { active: "ok", pending: "warn", expired: "bad", revoked: "bad", denied: "bad", refused: "bad" };
 
 async function perms() {
   const el = $("#tab-perms");
@@ -449,7 +610,7 @@ async function perms() {
     <div class="card"><h3>Sites your agent may use</h3>
       <p class="small muted">Your agent uses sessions you're already signed in to in your browser. It never types passwords or sign-in codes and never sees payment details. Agents ask for access; you approve each site in Approvals.</p>
       <table><tr><th>Site</th><th>Allowed to</th><th>Until</th><th>Status</th><th></th></tr>
-      ${p.grants.map((g) => `<tr><td><b>${esc(g.site)}</b>${g.reason ? `<div class="small muted">${esc(g.reason)}</div>` : ""}</td>
+      ${p.grants.map((g) => `<tr><td><b>${esc(g.site)}</b>${g.purpose ? `<div class="small">For: ${esc(g.purpose)}</div>` : ""}${g.reason ? `<div class="small muted">${esc(g.reason)}</div>` : ""}</td>
         <td class="small">${g.actions.map((a) => esc(actionLabels[a] ?? a)).join(", ")}</td><td class="small">${new Date(g.expiresAt).toLocaleDateString()}</td>
         <td><span class="chip ${grantState[g.state]}">${g.state}</span></td>
         <td>${g.state === "active" || g.state === "pending" ? `<button class="danger" data-revoke-grant="${g.id}">Revoke</button>` : ""}</td></tr>`).join("") || `<tr><td colspan="5" class="muted">None yet.</td></tr>`}
@@ -469,7 +630,8 @@ async function perms() {
     </div>
     <div class="card"><h3>What your agent did</h3><div class="table-wrap"><table>
       ${p.activity.map((a) => `<tr><td class="small muted">${date(a.createdAt)}</td><td>${esc(a.site)}</td><td class="small">${esc(actionLabels[a.action] ?? a.action)}</td>
-        <td class="small">${esc(a.summary)}</td><td>${a.allowed ? "" : `<span class="chip bad">not allowed</span>`}</td></tr>`).join("") || `<tr><td class="muted">Nothing yet.</td></tr>`}
+        <td class="small">${esc(a.summary)}${a.instruction ? `<div class="muted">Instruction: ${esc(a.instruction)}</div>` : ""}${a.reason ? `<div class="muted">Why: ${esc(a.reason)}</div>` : ""}${a.result ? `<div class="muted">Result: ${esc(a.result)}</div>` : ""}</td>
+        <td>${a.allowed ? "" : `<span class="chip bad">not allowed</span>`}</td></tr>`).join("") || `<tr><td class="muted">Nothing yet.</td></tr>`}
     </table></div></div>`;
   const on = (sel, fn) => $(sel) && ($(sel).onclick = act(fn));
   on("#consent", async () => {
@@ -515,7 +677,9 @@ async function wallet() {
 async function approveWithPasskey(id) {
   if (!me.hasPasskey && me.requirePasskey) { toast("Register a passkey first (Passkeys tab)."); location.hash = "security"; return false; }
   if (!me.hasPasskey) { await api("POST", `/api/approvals/${id}/approve`, {}); return true; }
-  const { summary, options } = await api("POST", `/api/approvals/${id}/start`);
+  const { summary, options, terms } = await api("POST", `/api/approvals/${id}/start`);
+  // The final confirmation: every flow shows the full terms before the passkey prompt, not only the Approvals tab.
+  if (!confirm(`${summary}\n\nBefore you approve:\n${(terms ?? []).map((t) => `• ${t}`).join("\n")}\n\nContinue to your passkey?`)) return false;
   toast("Confirm on your device: " + summary);
   const passkey = await startAuthentication({ optionsJSON: options });
   await api("POST", `/api/approvals/${id}/approve`, { passkey });
@@ -533,7 +697,9 @@ async function approvals() {
         <div class="spread" style="padding:10px 0;border-bottom:1px solid var(--line)">
           <div><b>${esc(a.summary)}</b>
             <div class="small muted">Requested by ${esc(a.agentKeyName || "you")} · ${date(a.createdAt)}</div>
-            ${a.input?.reason ? `<div class="small">Reason: “${esc(a.input.reason)}”</div>` : ""}
+            ${a.terms?.length ? `<div class="terms"><b class="small">Before you approve</b><ul class="small">${a.terms.map((t) => `<li>${esc(t)}</li>`).join("")}</ul></div>` : ""}
+            ${a.why ? `<div class="small"><b>Why it's asking:</b> ${esc(a.why)}</div>` : ""}
+            ${a.agentReason ? `<div class="small"><b>Agent's reason:</b> “${esc(a.agentReason)}”</div>` : a.input?.reason ? `<div class="small">Reason: “${esc(a.input.reason)}”</div>` : ""}
             ${a.kind === "call" ? `<div class="small muted">Input: <code>${esc(JSON.stringify(a.input).slice(0, 200))}</code></div>` : ""}
           </div>
           <div class="row"><button class="primary" data-approve="${a.id}">Approve with passkey</button><button class="danger" data-deny="${a.id}">Deny</button></div>
@@ -604,14 +770,30 @@ function readLimits(scope) {
   for (const [k] of limitFields) out[k] = toCents($(`[name=${k}]`, scope).value);
   const tools = $("[name=allowedToolSlugs]", scope).value.trim();
   out.allowedToolSlugs = tools ? tools.split(/[\s,]+/).filter(Boolean) : null;
+  out.level = $("[name=level]", scope).value;
+  out.observeAboveCents = toCents($("[name=observeAboveCents]", scope).value);
+  out.spendRules = [...scope.querySelectorAll(".rule")].map((r) => {
+    const v = (n) => $(`[name=${n}]`, r).value.trim();
+    return { name: v("rname"), tools: v("rtools") ? v("rtools").split(/[\s,]+/).filter(Boolean) : null, maxCents: toCents(v("rmax")) ?? 0, outcome: v("routcome") };
+  }).filter((r) => r.name);
   return out;
 }
+const levels = [["ask", "L0 · ask me for everything"], ["rules", "L1 · follow my rules"], ["budget", "L2 · free within budget"]];
+const ruleRow = (r = {}) => `<div class="row rule" style="margin-top:6px">
+  <input name="rname" placeholder="Rule name" value="${esc(r.name ?? "")}"><input name="rtools" placeholder="any tool" value="${esc((r.tools || []).join(", "))}">
+  <input name="rmax" type="number" min="0" step="0.01" placeholder="max $" value="${fromCents(r.maxCents)}" style="width:90px">
+  <select name="routcome"><option value="auto" ${r.outcome !== "observe" ? "selected" : ""}>pay on its own</option><option value="observe" ${r.outcome === "observe" ? "selected" : ""}>pay, flag for review</option></select>
+  <button class="danger" data-del-rule>×</button></div>`;
 
 async function agents() {
   const el = $("#tab-agents");
   const { agentKeys } = await api("GET", "/api/agent-keys");
   const limitInputs = (k = {}) => limitFields.map(([f, l]) => `<label>${l}<input name="${f}" type="number" min="0" step="0.01" value="${fromCents(k[f])}" placeholder="no limit"></label>`).join("") +
-    `<label>Allowed tools<input name="allowedToolSlugs" value="${esc((k.allowedToolSlugs || []).join(", "))}" placeholder="all tools"></label>`;
+    `<label>Allowed tools<input name="allowedToolSlugs" value="${esc((k.allowedToolSlugs || []).join(", "))}" placeholder="all tools"></label>
+    <label>Level<select name="level">${levels.map(([v, l]) => `<option value="${v}" ${v === (k.level ?? "budget") ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+    <label>Flag for review above ($)<input name="observeAboveCents" type="number" min="0" step="0.01" value="${fromCents(k.observeAboveCents)}" placeholder="never"></label>
+    <div style="grid-column:1/-1"><div class="small muted">Spend rules: what the agent may pay for on its own (tools blank = any tool)</div>
+      <div class="rules">${(k.spendRules || []).map(ruleRow).join("")}</div><button class="small" data-add-rule style="margin-top:6px">+ Add rule</button></div>`;
   el.innerHTML = `
     <div class="card"><h3>New agent key</h3>
       <p class="small muted">Give each agent its own key so you can see, limit and revoke it separately.</p>
@@ -621,10 +803,15 @@ async function agents() {
     ${agentKeys.map((k) => `<div class="card" data-key="${k.id}">
       <div class="spread"><div><h3>${esc(k.name)} ${k.revokedAt ? `<span class="chip bad">revoked</span>` : ""}</h3>
         <div class="small muted">${esc(k.keyPrefix)}… · created ${date(k.createdAt)}</div>
-        <div class="small">Spent ${usd(k.spend.spentLast24hCents)} in 24h · ${usd(k.spend.spentLast30dCents)} in 30 days</div></div>
+        <div class="small">Spent ${usd(k.spend.spentLast24hCents)} in 24h · ${usd(k.spend.spentLast30dCents)} in 30 days</div>
+        ${k.revokedAt ? "" : `<div class="small"><span class="chip">${esc(k.spend.levelLabel ?? k.level)}</span>${k.coolingOffUntil && new Date(k.coolingOffUntil) > new Date() ? ` <span style="color:var(--warn)">cooling off until ${date(k.coolingOffUntil)}</span>` : ""}</div>`}</div>
         ${k.revokedAt ? "" : `<button class="danger" data-revoke="${k.id}">Revoke</button>`}</div>
       ${k.revokedAt ? "" : `<div class="grid" style="margin-top:10px">${limitInputs(k)}</div><div class="row" style="margin-top:8px"><button data-save="${k.id}">Save limits</button></div>`}
     </div>`).join("")}`;
+  el.onclick = (e) => {
+    if (e.target.matches("[data-add-rule]")) e.target.previousElementSibling.insertAdjacentHTML("beforeend", ruleRow());
+    if (e.target.matches("[data-del-rule]")) e.target.closest(".rule").remove();
+  };
   $("#create").onclick = act(async () => {
     const scope = $("#newkey");
     const r = await api("POST", "/api/agent-keys", { name: $("[name=name]", scope).value, ...readLimits(scope) });

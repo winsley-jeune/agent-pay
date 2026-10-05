@@ -5,6 +5,7 @@ import type { AgentKey } from "./auth.js";
 import type { Db, Tx } from "./db.js";
 import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
+import { enforce, refusalMessage, screen } from "./policy.js";
 import { rememberPurchases } from "./shopping.js";
 
 // Grocery lists: typed, or read from a photo with Claude. The owner's agent
@@ -14,7 +15,7 @@ import { rememberPurchases } from "./shopping.js";
 
 export type Store = "walmart" | "whole_foods";
 export type ListStatus = "draft" | "shopping" | "ready" | "approved" | "ordered" | "canceled";
-export type ItemStatus = "needed" | "in_cart" | "substituted" | "unavailable" | "removed";
+export type ItemStatus = "needed" | "in_cart" | "substituted" | "unavailable" | "removed" | "refused";
 
 export interface NewItem {
   name: string;
@@ -216,14 +217,22 @@ export async function createList(
       [userId, (input.title?.trim() || "Groceries").slice(0, 100), input.store ?? null, input.source, input.unreadable ?? [], agentKey?.id ?? null],
     );
     let position = 0;
-    for (const i of items) {
-      await tx.query("INSERT INTO grocery_items (list_id, position, name, quantity, unit, notes, category) VALUES ($1, $2, $3, $4, $5, $6, $7)", [
-        rows[0].id, position++, i.name.slice(0, 120), i.quantity ?? null, i.unit?.slice(0, 20) ?? null, i.notes?.slice(0, 200) ?? null, i.category ?? null,
-      ]);
-    }
+    for (const i of items) await insertItem(tx, rows[0].id, position++, i);
     return rows[0].id as string;
   });
   return getList(db, userId, id);
+}
+
+/** Add one item. Something agents can't buy (alcohol, medicine...) stays on the list, marked refused, for the owner to buy themselves. */
+async function insertItem(tx: Tx, listId: string, position: number, i: NewItem) {
+  const refused = screen(`${i.name} ${i.notes ?? ""}`);
+  await tx.query(
+    "INSERT INTO grocery_items (list_id, position, name, quantity, unit, notes, category, status, substitute_note) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    [
+      listId, position, i.name.slice(0, 120), i.quantity ?? null, i.unit?.slice(0, 20) ?? null, i.notes?.slice(0, 200) ?? null, i.category ?? null,
+      refused ? "refused" : "needed", refused ? refusalMessage(refused) : null,
+    ],
+  );
 }
 
 async function lockEditable(tx: Tx, userId: string, listId: string) {
@@ -260,11 +269,7 @@ export async function addItems(db: Db, userId: string, listId: string, items: Ne
     await lockEditable(tx, userId, listId);
     const { rows } = await tx.query("SELECT COALESCE(MAX(position), -1) + 1 AS next FROM grocery_items WHERE list_id = $1", [listId]);
     let position: number = rows[0].next;
-    for (const i of items) {
-      await tx.query("INSERT INTO grocery_items (list_id, position, name, quantity, unit, notes, category) VALUES ($1, $2, $3, $4, $5, $6, $7)", [
-        listId, position++, i.name.slice(0, 120), i.quantity ?? null, i.unit ?? null, i.notes ?? null, i.category ?? null,
-      ]);
-    }
+    for (const i of items) await insertItem(tx, listId, position++, i);
   });
   return getList(db, userId, listId);
 }
@@ -285,8 +290,14 @@ export interface ItemUpdate {
 export async function updateItem(db: Db, userId: string, listId: string, itemId: number, u: ItemUpdate) {
   if (u.priceCents != null && (!Number.isSafeInteger(u.priceCents) || u.priceCents < 0)) throw new AppError(400, "invalid_price", "priceCents must be a non-negative integer");
   if (u.status === "substituted" && !u.substituteNote && !u.productName) throw new AppError(400, "substitute_needs_note", "say what was used instead (productName or substituteNote)");
+  if (u.status === "refused") throw new AppError(400, "invalid_status", "only AgentPay marks items refused");
+  enforce(u.name, u.productName, u.productUrl, u.substituteNote);
   await withTx(db, async (tx) => {
     const status = await lockEditable(tx, userId, listId);
+    const current = await tx.query("SELECT status FROM grocery_items WHERE id = $1 AND list_id = $2", [itemId, listId]);
+    if (current.rows[0]?.status === "refused" && u.status !== "removed") {
+      throw new AppError(403, "restricted_category", "this item is refused: agents can't buy it. The owner has to buy it themselves.");
+    }
     const columns: Record<keyof ItemUpdate, string> = {
       status: "status", name: "name", quantity: "quantity", unit: "unit", notes: "notes", productName: "product_name",
       productUrl: "product_url", priceCents: "price_cents", substituteNote: "substitute_note",

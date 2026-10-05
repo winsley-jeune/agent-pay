@@ -10,6 +10,9 @@ export default defineConfig({
       PUBLIC_URL: "http://localhost:8787",
       REQUIRE_PASSKEY: "true",
       ALLOW_DEV_CREDIT: "true",
+      // Off by default in tests so helpers can create a key and pay at once; tests that need them set them per key.
+      COOLING_OFF_HOURS: "0",
+      DRAIN_GUARD: "false",
     },
   },
 });

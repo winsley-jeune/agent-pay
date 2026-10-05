@@ -1,7 +1,7 @@
 import type { Db, Tx } from "./db.js";
 
 export type SystemAccount = "holds" | "platform_fees" | "stripe_clearing" | "dev_clearing" | "payouts";
-export type TxnType = "topup" | "hold" | "capture" | "release" | "refund" | "payout" | "dev_credit" | "subscription";
+export type TxnType = "topup" | "hold" | "capture" | "release" | "refund" | "payout" | "dev_credit" | "subscription" | "envelope" | "vault";
 
 export interface Entry {
   accountId: string;
@@ -24,7 +24,7 @@ export function resetSystemAccountCache() {
   systemAccountIds.clear();
 }
 
-export async function createAccount(tx: Tx, kind: "wallet" | "provider", ownerId: string): Promise<string> {
+export async function createAccount(tx: Tx, kind: "wallet" | "provider" | "envelope" | "vault", ownerId: string): Promise<string> {
   const { rows } = await tx.query("INSERT INTO accounts (kind, owner_id) VALUES ($1, $2) RETURNING id", [kind, ownerId]);
   return rows[0].id;
 }

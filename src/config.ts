@@ -29,4 +29,14 @@ export const config = {
   // Optional: automatic Amazon prices for price watches (https://keepa.com/#!api).
   keepaApiKey: process.env.KEEPA_API_KEY ?? "",
   upstreamTimeoutMs: Number(process.env.UPSTREAM_TIMEOUT_MS ?? 30_000),
+  // A new agent key only pays small calls on its own for its first hours (Singapore's cooling-off after a new device).
+  coolingOffHours: Number(process.env.COOLING_OFF_HOURS ?? 12),
+  coolingOffAutoMaxCents: Number(process.env.COOLING_OFF_AUTO_MAX_CENTS ?? 100),
+  // Asks the owner when one agent's last hour of spending looks like the wallet being drained.
+  drainGuard: process.env.DRAIN_GUARD !== "false",
+  drainGuardMinCents: Number(process.env.DRAIN_GUARD_MIN_CENTS ?? 2000),
+  // Money leaves the vault this long after the owner approves the unlock.
+  vaultUnlockDelayHours: Number(process.env.VAULT_UNLOCK_DELAY_HOURS ?? 24),
+  // The most AgentPay refunds per incident it covers. 0 = no guarantee published yet (a legal decision first).
+  guaranteeMaxCents: Number(process.env.GUARANTEE_MAX_CENTS ?? 0),
 };

@@ -188,4 +188,27 @@ describe("Stripe webhook", () => {
     expect((await deliver(completed("evt_wrong", topupId, 99_999))).status).toBe(422);
     expect((await call("GET", "/api/me", token)).body.balanceCents).toBe(0);
   });
+  it("serves the control board, freezes agents over HTTP, and checks the purchase policy", async () => {
+    const owner = await signup("board@example.com");
+    const created = await call("POST", "/api/agent-keys", owner, { name: "helper", level: "rules", spendRules: [{ name: "small", maxCents: 50 }] });
+    expect(created.body.agentKey).toMatchObject({ level: "rules", spendRules: [{ name: "small", tools: null, maxCents: 50, outcome: "auto" }] });
+    const agent = created.body.key as string;
+
+    const refused = await call("POST", "/api/agent/controls/policy/check", agent, { text: "6-pack of IPA beer" });
+    expect(refused.body).toMatchObject({ allowed: false, category: "alcohol" });
+    expect((await call("POST", "/api/agent/controls/policy/check", agent, { site: "https://www.walgreens.com" })).body.allowed).toBe(false);
+    expect((await call("POST", "/api/agent/controls/policy/check", agent, { text: "bananas" })).body.allowed).toBe(true);
+
+    const board = await call("GET", "/api/controls/board", owner);
+    expect(board.status).toBe(200);
+    expect(board.body.agents[0]).toMatchObject({ name: "helper", level: "rules", levelLabel: "L1 · pays only what a rule allows" });
+    expect(board.body).toMatchObject({ frozenAt: null, envelopes: [], pendingApprovals: 0 });
+
+    expect((await call("POST", "/api/controls/freeze", owner, {})).status).toBe(200);
+    const blocked = await call("GET", "/api/agent/balance", agent);
+    expect(blocked).toMatchObject({ status: 423, body: { error: { code: "frozen" } } });
+    expect((await call("POST", "/api/controls/unfreeze", owner, {})).body.approvalId).toBeTruthy();
+    expect((await call("GET", "/api/controls/audit/verify", owner)).body).toMatchObject({ ok: true });
+    expect((await call("GET", "/api/controls/nope", owner)).status).toBe(404);
+  });
 });

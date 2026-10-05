@@ -3,6 +3,7 @@ import { z } from "zod";
 import { BUNDLES, PRICES_AS_OF, SERVICES } from "./catalog.js";
 import type { Db } from "./db.js";
 import {
+  acceptPrice,
   addExternal,
   allSubscriptions,
   cancelGuide,
@@ -63,7 +64,10 @@ export function externalRoutes(db: Db, as: "owner" | "agent") {
     h(async (req) => importStatement(db, userId(req), parseStatementCsv(parse(importSchema, req.body).csv))),
   );
   r.get("/:id", h(async (req) => ({ subscription: await getExternal(db, userId(req), String(req.params.id)) })));
-  r.patch("/:id", h(async (req) => ({ subscription: await updateExternal(db, userId(req), String(req.params.id), parse(updateSchema, req.body)) })));
+  r.patch(
+    "/:id",
+    h(async (req) => ({ subscription: await updateExternal(db, userId(req), String(req.params.id), parse(updateSchema, req.body), { byOwner: as === "owner" }) })),
+  );
   r.get("/:id/cancel-guide", h(async (req) => cancelGuide(await getExternal(db, userId(req), String(req.params.id)))));
   r.post(
     "/:id/request-cancel",
@@ -79,6 +83,8 @@ export function externalRoutes(db: Db, as: "owner" | "agent") {
     })),
   );
   if (as === "owner") {
+    // Keeping a subscription at a higher price is the owner's call, never the agent's.
+    r.post("/:id/accept-price", h(async (req) => ({ subscription: await acceptPrice(db, userId(req), String(req.params.id)) })));
     r.delete(
       "/:id",
       h(async (req) => {

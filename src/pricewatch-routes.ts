@@ -2,6 +2,7 @@ import express from "express";
 import { z } from "zod";
 import type { Db } from "./db.js";
 import { h, parse } from "./http.js";
+import { checkMandate, listMandates, requestMandate, revokeMandate } from "./mandates.js";
 import { addWatch, getWatch, listWatches, markAlertsSeen, markBought, recordPrice, saleTiming, stopWatch, unseenAlerts, updateWatch } from "./pricewatch.js";
 
 const cents = z.number().int().positive().max(100_000_000);
@@ -42,8 +43,34 @@ export function priceWatchRoutes(db: Db, as: "owner" | "agent") {
   );
   r.post(
     "/:id/bought",
-    h(async (req) => ({ watch: await markBought(db, userId(req), String(req.params.id), parse(z.object({ priceCents: cents.optional() }), req.body).priceCents) })),
+    h(async (req) => ({
+      watch: await markBought(db, userId(req), String(req.params.id), parse(z.object({ priceCents: cents.optional() }), req.body).priceCents, as === "agent" ? req.agentKey! : null),
+    })),
   );
+  r.get("/:id/mandates", h(async (req) => ({ mandates: await listMandates(db, userId(req), { watchId: String(req.params.id), includeEnded: true }) })));
+  r.post(
+    "/:id/mandate",
+    h(async (req) =>
+      requestMandate(db, userId(req), as === "agent" ? req.agentKey! : null, {
+        watchId: String(req.params.id),
+        ...parse(z.object({ maxPriceCents: cents.optional(), quantity: z.number().int().min(1).max(10).optional(), days: z.number().int().min(1).max(90).optional() }), req.body),
+      }),
+    ),
+  );
+  r.post(
+    "/:id/check-mandate",
+    h(async (req) =>
+      checkMandate(db, userId(req), { watchId: String(req.params.id), ...parse(z.object({ priceCents: cents, site: z.string().min(3).max(2000) }), req.body) }),
+    ),
+  );
+  if (as === "owner") {
+    r.delete(
+      "/mandates/:mandateId",
+      h(async (req) => {
+        await revokeMandate(db, userId(req), String(req.params.mandateId));
+      }),
+    );
+  }
   r.post(
     "/:id/stop",
     h(async (req) => {

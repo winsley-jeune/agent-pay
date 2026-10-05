@@ -10,8 +10,14 @@ import { approveExternalCancel, denyExternalCancel } from "./external.js";
 import { approveGroceryOrder, denyGroceryOrder } from "./grocery.js";
 import { ACTION_LABELS, activateGrant, denyGrant, recordConsent, RISK_STATEMENT, type BrowserAction } from "./permissions.js";
 import { activateSubscription, resumeSubscription } from "./subscriptions.js";
+import { auditTx } from "./audit.js";
+import { activateEnvelope, applyUnfreeze, approveVaultUnlock, denyEnvelope, denyVaultUnlock } from "./controls.js";
+import { activateMandate, denyMandate } from "./mandates.js";
+import { CHECKOUT_BUFFER } from "./grocery.js";
 
-export type ApprovalKind = "call" | "subscription" | "resume" | "external_cancel" | "grocery_order" | "risk_consent" | "browser_access";
+export type ApprovalKind =
+  | "call" | "subscription" | "resume" | "external_cancel" | "grocery_order" | "risk_consent" | "browser_access"
+  | "envelope" | "buy_mandate" | "unfreeze" | "vault_unlock";
 
 export interface Approval {
   id: string;
@@ -27,6 +33,12 @@ export interface Approval {
   externalName: string | null;
   agentKeyId: string | null;
   agentKeyName: string | null;
+  /** Why AgentPay asked, e.g. "no spending rule covers this call". */
+  why: string | null;
+  /** The agent's own reason. */
+  agentReason: string | null;
+  maxPriceCents: number | null;
+  billedThrough: string | null;
   createdAt: Date;
   decidedAt: Date | null;
 }
@@ -34,7 +46,8 @@ export interface Approval {
 const approvalColumns = `ap.id, ap.kind, ap.status, ap.amount_cents AS "amountCents", ap.input, t.slug AS tool,
   pl.slug AS plan, COALESCE(pl.interval, es.interval) AS interval, ap.subscription_id AS "subscriptionId",
   ap.external_subscription_id AS "externalSubscriptionId", es.name AS "externalName", ap.grocery_list_id AS "groceryListId", ap.agent_key_id AS "agentKeyId",
-  k.name AS "agentKeyName", ap.created_at AS "createdAt", ap.decided_at AS "decidedAt"`;
+  k.name AS "agentKeyName", ap.why, ap.agent_reason AS "agentReason", s.max_price_cents AS "maxPriceCents", es.billed_through AS "billedThrough",
+  ap.created_at AS "createdAt", ap.decided_at AS "decidedAt"`;
 const approvalFrom = `approvals ap
   LEFT JOIN tools t ON t.id = ap.tool_id
   LEFT JOIN subscriptions s ON s.id = ap.subscription_id
@@ -58,16 +71,101 @@ export function describeApproval(a: Pick<Approval, "kind" | "amountCents" | "too
   if (a.kind === "external_cancel") {
     return `Cancel ${a.externalName}${a.amountCents > 0 ? ` (early termination fee about ${dollars})` : ""}`;
   }
+  if (a.kind === "envelope") {
+    const i = a.input as { name?: string; agent?: string | null; expiresOn?: string };
+    return `Set aside ${dollars} in "${i.name}" for ${i.agent ?? "any of my agents"} until ${i.expiresOn}`;
+  }
+  if (a.kind === "buy_mandate") {
+    const i = a.input as { title?: string; site?: string; maxPriceCents?: number; quantity?: number; expiresOn?: string };
+    return `Let my agent buy "${i.title}" on ${i.site} at up to $${((i.maxPriceCents ?? 0) / 100).toFixed(2)} each (at most ${i.quantity}) until ${i.expiresOn}`;
+  }
+  if (a.kind === "unfreeze") return "Unfreeze my agents: they can spend again within their limits";
+  if (a.kind === "vault_unlock") return `Move ${dollars} from my vault back to my wallet after a ${(a.input as { delayHours?: number }).delayHours}-hour wait`;
   if (a.kind === "call") return `Pay ${dollars} for one call to ${a.tool}`;
   if (a.kind === "subscription") return `Subscribe to ${a.plan} for ${dollars} per ${a.interval}, renewing automatically`;
   return `Renew ${a.plan} at ${dollars} per ${a.interval}`;
 }
 
-export async function createCallApproval(db: Db, agentKey: AgentKey, tool: Tool, amountCents: number, input: unknown): Promise<string> {
+const PER_YEAR: Record<string, number> = { week: 52, month: 12, year: 1 };
+
+/**
+ * The "final confirmation" lines shown with the summary before the owner signs
+ * (modelled on Japan's 2022 rule for subscription order screens): what it costs
+ * per period and over a year, when it renews, the most it can cost, and how to
+ * undo it. Bound into the passkey challenge together with the summary.
+ */
+export function approvalTerms(
+  a: Pick<Approval, "kind" | "amountCents" | "tool" | "plan" | "interval" | "externalName" | "input" | "maxPriceCents" | "billedThrough">,
+): string[] {
+  const usd = (c: number) => `$${(c / 100).toFixed(2)}`;
+  const i = (a.input ?? {}) as Record<string, any>;
+  switch (a.kind) {
+    case "call":
+      return [`One charge of ${usd(a.amountCents)} from your prepaid wallet`, "Not charged if the provider fails or times out", "Can be used once, for this call only"];
+    case "subscription":
+    case "resume": {
+      const perYear = PER_YEAR[a.interval ?? "month"] ?? 12;
+      return [
+        `${usd(a.amountCents)} now, then ${usd(a.amountCents)} every ${a.interval}`,
+        `About ${usd(a.amountCents * perYear)} over 12 months`,
+        "Renews automatically from your wallet until you cancel",
+        ...(a.maxPriceCents ? [`If the price goes above ${usd(a.maxPriceCents)}, it stops until you approve the new price`] : []),
+        "Cancel any time on the Subscriptions page; it runs to the end of the paid period, or choose End now",
+      ];
+    }
+    case "grocery_order":
+      return [
+        `Estimated ${usd(a.amountCents)}; your agent may check out up to ${usd(i.maxCents ?? a.amountCents)} (${Math.round(CHECKOUT_BUFFER * 100)}% for weighed produce and fees)`,
+        "One checkout only. If the cart changes, this approval is cancelled",
+        "Refunds and substitutions follow the store's own policies",
+      ];
+    case "external_cancel":
+      return [
+        ...(a.amountCents > 0 ? [`Cancelling may cost about ${usd(a.amountCents)} (early termination fee or device balance)`] : []),
+        a.billedThrough && a.billedThrough !== "direct" ? `Billed through ${a.billedThrough}: it has to be cancelled there` : "Cancelled with the company that bills it",
+        "Your agent can record it as cancelled only after you approve",
+      ];
+    case "browser_access":
+      return [
+        ...(i.purpose ? [`Purpose: ${i.purpose}`] : []),
+        `Ends after ${i.days} days; revoke any time on the Permissions page`,
+        "Your agent never types passwords or sign-in codes and never sees payment details",
+      ];
+    case "envelope":
+      return [
+        `${usd(a.amountCents)} moves from your wallet now`,
+        `Only for ${i.tools?.length ? `these tools: ${i.tools.join(", ")}` : "any paid tool"}${i.purpose ? ` (${i.purpose})` : ""}`,
+        "Calls paid from it don't ask you again, within your agent's per-call limit and caps",
+        `Ends on ${i.expiresOn}; whatever is left returns to your wallet. You can close it sooner`,
+      ];
+    case "buy_mandate":
+      return [
+        `At most ${i.quantity} at up to ${usd(i.maxPriceCents ?? 0)} each: ${usd(a.amountCents)} in total`,
+        `Only on ${i.site}, only after your agent checks this mandate, until ${i.expiresOn}`,
+        "AgentPay can't block the store's checkout yet: this is a rule your agent follows, logged and checked afterwards",
+        "Revoke it any time on the Price watch page",
+      ];
+    case "unfreeze":
+      return ["Agents can call paid tools again, within each one's level and limits", "AgentPay plan renewals resume"];
+    case "vault_unlock":
+      return [`The money moves after ${i.delayHours} hours`, "You can cancel during the wait", "Until then, no agent or approval can spend it"];
+    default:
+      return [];
+  }
+}
+
+export async function createCallApproval(
+  db: Db,
+  agentKey: AgentKey,
+  tool: Tool,
+  amountCents: number,
+  input: unknown,
+  meta: { why?: string; agentReason?: string } = {},
+): Promise<string> {
   const { rows } = await db.query(
-    `INSERT INTO approvals (kind, user_id, agent_key_id, tool_id, amount_cents, input)
-     VALUES ('call', $1, $2, $3, $4, $5) RETURNING id`,
-    [agentKey.userId, agentKey.id, tool.id, amountCents, JSON.stringify(input)],
+    `INSERT INTO approvals (kind, user_id, agent_key_id, tool_id, amount_cents, input, why, agent_reason)
+     VALUES ('call', $1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+    [agentKey.userId, agentKey.id, tool.id, amountCents, JSON.stringify(input), meta.why ?? null, meta.agentReason?.slice(0, 500) ?? null],
   );
   return rows[0].id;
 }
@@ -85,7 +183,7 @@ export async function listApprovals(db: Db, userId: string, status?: string) {
       ORDER BY ap.created_at DESC LIMIT 100`,
     [userId, status ?? null],
   );
-  return rows.map((a: Approval) => ({ ...a, summary: describeApproval(a) }));
+  return rows.map((a: Approval) => ({ ...a, summary: describeApproval(a), terms: approvalTerms(a) }));
 }
 
 /** What an agent may see about one of its own approvals. */
@@ -105,8 +203,9 @@ export async function startApproval(db: Db, userId: string, id: string) {
   const approval = await getApproval(db, userId, id);
   if (approval.status !== "pending") throw new AppError(409, "not_pending", `this approval is already ${approval.status}`);
   const summary = describeApproval(approval);
-  const options = await startApprovalSignature(db, userId, { id, amountCents: approval.amountCents, summary });
-  return { summary, options };
+  const terms = approvalTerms(approval);
+  const options = await startApprovalSignature(db, userId, { id, amountCents: approval.amountCents, summary, terms });
+  return { summary, terms, options };
 }
 
 /**
@@ -126,7 +225,8 @@ export async function approve(
   return withTx(db, async (tx) => {
     const { rows } = await tx.query(
       `SELECT id, kind, status, amount_cents AS "amountCents", subscription_id AS "subscriptionId",
-              external_subscription_id AS "externalSubscriptionId", grocery_list_id AS "groceryListId", browser_grant_id AS "browserGrantId", input
+              external_subscription_id AS "externalSubscriptionId", grocery_list_id AS "groceryListId", browser_grant_id AS "browserGrantId", input,
+              envelope_id AS "envelopeId", buy_mandate_id AS "buyMandateId", vault_unlock_id AS "vaultUnlockId"
          FROM approvals WHERE id = $1 AND user_id = $2 FOR UPDATE`,
       [id, userId],
     );
@@ -161,8 +261,24 @@ export async function approve(
     } else if (approval.kind === "grocery_order") {
       await approveGroceryOrder(tx, approval.groceryListId, approval.input ?? {});
       newStatus = "used";
+    } else if (approval.kind === "envelope") {
+      await activateEnvelope(tx, userId, approval.envelopeId);
+      newStatus = "used";
+    } else if (approval.kind === "buy_mandate") {
+      await activateMandate(tx, approval.buyMandateId);
+      newStatus = "used";
+    } else if (approval.kind === "unfreeze") {
+      await applyUnfreeze(tx, userId);
+      newStatus = "used";
+    } else if (approval.kind === "vault_unlock") {
+      await approveVaultUnlock(tx, approval.vaultUnlockId);
+      newStatus = "used";
     }
     await tx.query("UPDATE approvals SET status = $2, decided_at = now(), passkey_id = $3 WHERE id = $1", [id, newStatus, passkeyId]);
+    await auditTx(tx, userId, {
+      actor: "owner", kind: "approved", summary: `Approved: ${approval.kind.replaceAll("_", " ")}`,
+      result: passkeyId ? "signed with a passkey" : "approved without a passkey", data: { approvalId: id, amountCents: approval.amountCents },
+    });
     return { id, status: newStatus, signedWithPasskey: passkeyId !== null };
   });
 }
@@ -174,7 +290,8 @@ export async function deny(db: Db, userId: string, id: string) {
       `UPDATE approvals SET status = 'denied', decided_at = now()
         WHERE id = $1 AND user_id = $2 AND status = 'pending'
         RETURNING kind, subscription_id AS "subscriptionId", external_subscription_id AS "externalSubscriptionId",
-                  grocery_list_id AS "groceryListId", browser_grant_id AS "browserGrantId", input`,
+                  grocery_list_id AS "groceryListId", browser_grant_id AS "browserGrantId", input,
+                  envelope_id AS "envelopeId", buy_mandate_id AS "buyMandateId", vault_unlock_id AS "vaultUnlockId"`,
       [id, userId],
     );
     if (!rows[0]) throw new AppError(404, "not_found", "no pending approval with that id");
@@ -183,6 +300,9 @@ export async function deny(db: Db, userId: string, id: string) {
     }
     if (rows[0].kind === "grocery_order") await denyGroceryOrder(tx, rows[0].groceryListId);
     if (rows[0].kind === "browser_access") await denyGrant(tx, rows[0].browserGrantId);
+    if (rows[0].kind === "envelope") await denyEnvelope(tx, rows[0].envelopeId);
+    if (rows[0].kind === "buy_mandate") await denyMandate(tx, rows[0].buyMandateId);
+    if (rows[0].kind === "vault_unlock") await denyVaultUnlock(tx, rows[0].vaultUnlockId);
     if (rows[0].kind === "external_cancel") {
       await denyExternalCancel(tx, rows[0].externalSubscriptionId, rows[0].input?.previousStatus);
     }

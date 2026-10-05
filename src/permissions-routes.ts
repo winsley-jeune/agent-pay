@@ -54,12 +54,27 @@ export function permissionsRoutes(db: Db, as: "owner" | "agent") {
     "/request",
     h(async (req) =>
       requestBrowserAccess(db, userId(req), agentKey(req),
-        parse(z.object({ site: z.string().min(3).max(200), actions, reason: z.string().max(300).optional(), days: z.number().int().min(1).max(365).optional() }), req.body)),
+        parse(
+          z.object({
+            site: z.string().min(3).max(200), actions, reason: z.string().max(300).optional(),
+            purpose: z.string().max(200).optional(), days: z.number().int().min(1).max(365).optional(),
+          }),
+          req.body,
+        )),
     ),
   );
   r.post(
     "/activity",
-    h(async (req) => logActivity(db, userId(req), agentKey(req), parse(z.object({ site: z.string().min(3).max(200), action: z.enum(BROWSER_ACTIONS), summary: z.string().min(1).max(500) }), req.body))),
+    h(async (req) =>
+      logActivity(db, userId(req), agentKey(req),
+        parse(
+          z.object({
+            site: z.string().min(3).max(200), action: z.enum(BROWSER_ACTIONS), summary: z.string().min(1).max(500),
+            instruction: z.string().max(500).optional(), reason: z.string().max(500).optional(), result: z.string().max(500).optional(),
+          }),
+          req.body,
+        )),
+    ),
   );
   r.get("/preferences", h(async (req) => getPreferences(db, userId(req))));
 

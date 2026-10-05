@@ -2,6 +2,8 @@ import type { AgentKey } from "./auth.js";
 import type { Db, Tx } from "./db.js";
 import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
+import { auditTx } from "./audit.js";
+import { enforce, enforceSite, refusalMessage, screenSite } from "./policy.js";
 
 // What the owner allows their agent to do in the owner's own, already
 // signed-in browser. A grant is a recorded permission and a rule the agent
@@ -98,24 +100,26 @@ export async function requestBrowserAccess(
   db: Db,
   userId: string,
   agentKey: AgentKey | null,
-  input: { site: string; actions: BrowserAction[]; reason?: string; days?: number },
+  input: { site: string; actions: BrowserAction[]; reason?: string; days?: number; purpose?: string },
 ) {
   if (!(await currentConsent(db, userId))) {
     throw new AppError(403, "needs_consent", "the owner has to read and accept the risk statement first (Permissions page)");
   }
   const site = normalizeSite(input.site);
+  enforceSite(site);
+  enforce(input.purpose, input.reason);
   const actions = [...new Set(input.actions)];
   if (!actions.length || actions.some((a) => !BROWSER_ACTIONS.includes(a))) throw new AppError(400, "invalid_actions", `actions must be some of ${BROWSER_ACTIONS.join(", ")}`);
   const days = Math.min(Math.max(Math.round(input.days ?? 30), 1), 365);
   return withTx(db, async (tx) => {
     const { rows } = await tx.query(
-      `INSERT INTO browser_grants (user_id, site, actions, reason, agent_key_id, expires_at)
-       VALUES ($1, $2, $3, $4, $5, now() + make_interval(days => $6)) RETURNING id`,
-      [userId, site, actions, input.reason?.slice(0, 300) ?? null, agentKey?.id ?? null, days],
+      `INSERT INTO browser_grants (user_id, site, actions, reason, agent_key_id, expires_at, purpose)
+       VALUES ($1, $2, $3, $4, $5, now() + make_interval(days => $6), $7) RETURNING id`,
+      [userId, site, actions, input.reason?.slice(0, 300) ?? null, agentKey?.id ?? null, days, input.purpose?.slice(0, 200) ?? null],
     );
     const approval = await tx.query(
       "INSERT INTO approvals (kind, user_id, agent_key_id, browser_grant_id, amount_cents, input) VALUES ('browser_access', $1, $2, $3, 0, $4) RETURNING id",
-      [userId, agentKey?.id ?? null, rows[0].id, JSON.stringify({ site, actions, days, reason: input.reason ?? null })],
+      [userId, agentKey?.id ?? null, rows[0].id, JSON.stringify({ site, actions, days, reason: input.reason ?? null, purpose: input.purpose ?? null })],
     );
     return { status: "pending_approval" as const, approvalId: approval.rows[0].id as string, grantId: rows[0].id as string, site, actions, days };
   });
@@ -138,7 +142,7 @@ export async function revokeGrant(db: Db, userId: string, grantId: string) {
 
 export async function listGrants(db: Db, userId: string) {
   const { rows } = await db.query(
-    `SELECT g.id, g.site, g.actions, g.reason, g.status, g.expires_at AS "expiresAt", g.revoked_at AS "revokedAt",
+    `SELECT g.id, g.site, g.actions, g.reason, g.purpose, g.status, g.expires_at AS "expiresAt", g.revoked_at AS "revokedAt",
             g.created_at AS "createdAt", k.name AS "agentKeyName",
             CASE WHEN g.revoked_at IS NOT NULL THEN 'revoked' WHEN g.status <> 'active' THEN g.status
                  WHEN g.expires_at < now() THEN 'expired' ELSE 'active' END AS state
@@ -149,12 +153,14 @@ export async function listGrants(db: Db, userId: string) {
   return rows;
 }
 
-export type AccessStatus = "allowed" | "needs_consent" | "needs_grant" | "expired" | "revoked";
+export type AccessStatus = "allowed" | "needs_consent" | "needs_grant" | "expired" | "revoked" | "refused";
 
 /** May the agent do `action` on `site` right now? */
 export async function checkAccess(q: Db | Tx, userId: string, siteInput: string, action: BrowserAction) {
   const host = normalizeSite(siteInput);
   if (!BROWSER_ACTIONS.includes(action)) throw new AppError(400, "invalid_action", `action must be one of ${BROWSER_ACTIONS.join(", ")}`);
+  const refused = screenSite(host);
+  if (refused) return { status: "refused" as AccessStatus, site: host, message: `${refusalMessage(refused)} Don't open or use this site.` };
   if (!(await currentConsent(q, userId))) {
     return { status: "needs_consent" as AccessStatus, site: host, message: "The owner hasn't accepted the risk statement. Ask them to open the Permissions page." };
   }
@@ -171,19 +177,40 @@ export async function checkAccess(q: Db | Tx, userId: string, siteInput: string,
   return { status: "needs_grant" as AccessStatus, site: host, message: `No permission to ${ACTION_LABELS[action]} on ${host}. Ask with request_browser_access.` };
 }
 
-/** The agent records what it did (or was about to do). Logged even when not allowed, so the owner sees attempts. */
-export async function logActivity(db: Db, userId: string, agentKey: AgentKey | null, input: { site: string; action: BrowserAction; summary: string }) {
+/**
+ * The agent records what it did (or was about to do), the owner's instruction
+ * it came from, why, and what happened. Logged even when not allowed, so the
+ * owner sees attempts. Also goes into the hash-chained "why" log.
+ */
+export async function logActivity(
+  db: Db,
+  userId: string,
+  agentKey: AgentKey | null,
+  input: { site: string; action: BrowserAction; summary: string; instruction?: string; reason?: string; result?: string },
+) {
   const access = await checkAccess(db, userId, input.site, input.action);
-  await db.query(
-    "INSERT INTO agent_activity (user_id, agent_key_id, site, action, summary, grant_id, allowed) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-    [userId, agentKey?.id ?? null, access.site, input.action, input.summary.slice(0, 500), "grantId" in access ? access.grantId : null, access.status === "allowed"],
-  );
+  const allowed = access.status === "allowed";
+  await withTx(db, async (tx) => {
+    await tx.query(
+      `INSERT INTO agent_activity (user_id, agent_key_id, site, action, summary, grant_id, allowed, instruction, reason, result)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [
+        userId, agentKey?.id ?? null, access.site, input.action, input.summary.slice(0, 500), "grantId" in access ? access.grantId : null, allowed,
+        input.instruction?.slice(0, 500) ?? null, input.reason?.slice(0, 500) ?? null, input.result?.slice(0, 500) ?? null,
+      ],
+    );
+    await auditTx(tx, userId, {
+      actor: "agent", agentKeyId: agentKey?.id ?? null, kind: "browser_activity", summary: `${access.site}: ${input.summary}`,
+      instruction: input.instruction, reason: input.reason, result: input.result,
+      data: { site: access.site, action: input.action, allowed, access: access.status },
+    });
+  });
   return access;
 }
 
 export async function listActivity(db: Db, userId: string, limit = 100) {
   const { rows } = await db.query(
-    `SELECT a.id, a.site, a.action, a.summary, a.allowed, a.created_at AS "createdAt", k.name AS "agentKeyName"
+    `SELECT a.id, a.site, a.action, a.summary, a.instruction, a.reason, a.result, a.allowed, a.created_at AS "createdAt", k.name AS "agentKeyName"
        FROM agent_activity a LEFT JOIN agent_keys k ON k.id = a.agent_key_id
       WHERE a.user_id = $1 ORDER BY a.created_at DESC LIMIT $2`,
     [userId, limit],

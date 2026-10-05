@@ -30,6 +30,8 @@ export interface ExternalSubscription {
   lastUsedOn: string | null;
   merchantKey: string | null;
   priceHistory: { date: string; fromCents: number; toCents: number }[];
+  /** The price the owner accepted; a newer, higher price waits for "keep" or "cancel". */
+  acceptedPriceCents: number | null;
   notes: string | null;
   source: "manual" | "import" | "agent";
   canceledAt: Date | null;
@@ -62,7 +64,7 @@ const extColumns = `id, user_id AS "userId", service_slug AS "serviceSlug", name
   to_char(next_renewal_on, 'YYYY-MM-DD') AS "nextRenewalOn", to_char(trial_ends_on, 'YYYY-MM-DD') AS "trialEndsOn",
   to_char(contract_until, 'YYYY-MM-DD') AS "contractUntil", early_termination_fee_cents AS "earlyTerminationFeeCents",
   to_char(last_used_on, 'YYYY-MM-DD') AS "lastUsedOn", merchant_key AS "merchantKey", price_history AS "priceHistory",
-  notes, source, canceled_at AS "canceledAt", cancel_confirmation AS "cancelConfirmation", created_at AS "createdAt"`;
+  accepted_price_cents AS "acceptedPriceCents", notes, source, canceled_at AS "canceledAt", cancel_confirmation AS "cancelConfirmation", created_at AS "createdAt"`;
 
 const isoDate = /^\d{4}-\d{2}-\d{2}$/;
 function checkDate(field: string, v: string | null | undefined) {
@@ -155,7 +157,13 @@ const updatable: Record<string, string> = {
   contractUntil: "contract_until", earlyTerminationFeeCents: "early_termination_fee_cents", lastUsedOn: "last_used_on", notes: "notes",
 };
 
-export async function updateExternal(db: Db, userId: string, id: string, input: ExternalInput & { status?: "active" | "trial" }) {
+export async function updateExternal(
+  db: Db,
+  userId: string,
+  id: string,
+  input: ExternalInput & { status?: "active" | "trial" },
+  opts: { byOwner?: boolean } = {},
+) {
   for (const f of ["nextRenewalOn", "trialEndsOn", "contractUntil", "lastUsedOn"] as const) checkDate(f, input[f]);
   return withTx(db, async (tx) => {
     const current = await getExternal(tx, userId, id);
@@ -175,6 +183,11 @@ export async function updateExternal(db: Db, userId: string, id: string, input: 
     if (input.priceCents !== undefined && input.priceCents !== current.priceCents) {
       values.push(JSON.stringify([...current.priceHistory, { date: new Date().toISOString().slice(0, 10), fromCents: current.priceCents, toCents: input.priceCents }]));
       sets.push(`price_history = $${values.length}`);
+      // The owner typing in the new price is accepting it; an agent reporting it is not.
+      if (opts.byOwner) {
+        values.push(input.priceCents);
+        sets.push(`accepted_price_cents = $${values.length}`);
+      }
     }
     if (sets.length) {
       values.push(id, userId);
@@ -575,7 +588,36 @@ function titleCase(s: string): string {
 
 // ---------------------------------------------------------------- reminders + one view
 
-export type Reminder = { type: "renewal" | "trial_ending" | "contract_ending"; subscriptionId: string; name: string; on: string; daysLeft: number; message: string };
+/**
+ * One-tap actions shown with a reminder (Alipay's "cancel auto-debit" button on
+ * every debit notice). request_cancel starts a cancellation the owner approves;
+ * accept_price keeps the subscription at its new price.
+ */
+export type ReminderAction = "request_cancel" | "accept_price";
+export type Reminder = {
+  type: "renewal" | "trial_ending" | "contract_ending" | "price_rise";
+  subscriptionId: string;
+  name: string;
+  on: string;
+  daysLeft: number;
+  message: string;
+  actions: ReminderAction[];
+};
+
+/** A price rise the owner hasn't decided on yet (Korea requires consent before a subscription costs more). */
+export function pendingPriceRise(s: ExternalSubscription) {
+  const raise = s.priceHistory.at(-1);
+  if (!raise || raise.toCents <= raise.fromCents || raise.toCents !== s.priceCents) return null;
+  if (s.status !== "active" && s.status !== "trial") return null;
+  if ((s.acceptedPriceCents ?? raise.fromCents) >= s.priceCents) return null;
+  return raise;
+}
+
+export async function acceptPrice(db: Db, userId: string, id: string) {
+  const s = await getExternal(db, userId, id);
+  await db.query("UPDATE external_subscriptions SET accepted_price_cents = price_cents WHERE id = $1 AND user_id = $2", [id, userId]);
+  return { ...s, acceptedPriceCents: s.priceCents };
+}
 
 /** Move renewal dates that have passed forward to the next one. Billing happens at the merchant; this only keeps dates right. */
 export async function rollRenewalDates(db: Db, today = new Date().toISOString().slice(0, 10)): Promise<number> {
@@ -604,7 +646,9 @@ export async function reminders(db: Db, userId: string, today = new Date().toISO
   const add = (type: Reminder["type"], s: ExternalSubscription, on: string | null, within: number, msg: (d: number) => string) => {
     if (!on) return;
     const d = daysBetween(today, on);
-    if (d >= 0 && d <= within) out.push({ type, subscriptionId: s.id, name: s.name, on, daysLeft: d, message: msg(d) });
+    const canCancel = s.status === "active" || s.status === "trial";
+    const actions: ReminderAction[] = type === "contract_ending" || !canCancel ? [] : ["request_cancel"];
+    if (d >= 0 && d <= within) out.push({ type, subscriptionId: s.id, name: s.name, on, daysLeft: d, message: msg(d), actions });
   };
   const when = (d: number) => (d === 0 ? "today" : d === 1 ? "tomorrow" : `in ${d} days`);
   for (const s of subs) {
@@ -612,6 +656,13 @@ export async function reminders(db: Db, userId: string, today = new Date().toISO
     if (s.status === "trial") add("trial_ending", s, s.trialEndsOn, 7, (d) => `${s.name} free trial ends ${when(d)}; then it costs ${price}/${s.interval}. Cancel before then if you don't want it.`);
     else add("renewal", s, s.nextRenewalOn, s.interval === "year" ? 14 : 3, (d) => `${s.name} renews ${when(d)} for ${price}.`);
     add("contract_ending", s, s.contractUntil, 30, (d) => `${s.name} contract ends ${when(d)}: a good time to switch plans or carriers without a fee.`);
+    const raise = pendingPriceRise(s);
+    if (raise) {
+      out.push({
+        type: "price_rise", subscriptionId: s.id, name: s.name, on: raise.date, daysLeft: 0, actions: ["accept_price", "request_cancel"],
+        message: `${s.name} went up from $${(raise.fromCents / 100).toFixed(2)} to ${price}. Keep it at the new price, or cancel?`,
+      });
+    }
   }
   return out.sort((a, b) => a.daysLeft - b.daysLeft);
 }

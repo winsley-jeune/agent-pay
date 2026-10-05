@@ -24,7 +24,10 @@ import { expireWatches, refreshFromKeepa } from "./pricewatch.js";
 import { priceWatchRoutes } from "./pricewatch-routes.js";
 import { groceryRoutes } from "./grocery-routes.js";
 import { permissionsRoutes } from "./permissions-routes.js";
+import { agentControlsRoutes, controlsRoutes } from "./controls-routes.js";
+import { frozenAt, frozenError, releaseVaultUnlocks, sweepEnvelopes } from "./controls.js";
 import { callPaidTool, getToolForAgent, spendSummary, sweepExpiredHolds } from "./gateway.js";
+import { decideCall } from "./controls.js";
 import { balance, history } from "./ledger.js";
 import { migrate } from "./migrate.js";
 import { deletePasskey, finishRegistration, hasPasskey, listPasskeys, startRegistration } from "./passkeys.js";
@@ -64,6 +67,12 @@ const limitsSchema = z.object({
   monthlyCapCents: nullableCents,
   approvalThresholdCents: nullableCents,
   allowedToolSlugs: z.array(slug).nullable().optional(),
+  level: z.enum(["ask", "rules", "budget"]).optional(),
+  spendRules: z
+    .array(z.object({ name: z.string().min(1).max(60), tools: z.array(slug).nullable().default(null), maxCents: cents, outcome: z.enum(["auto", "observe"]).default("auto") }))
+    .max(20)
+    .optional(),
+  observeAboveCents: nullableCents,
 });
 
 export function createApp(db: Db) {
@@ -97,7 +106,8 @@ export function createApp(db: Db) {
     (token?.startsWith("ap_agent_") ? agentKeyByToken(db, token) : Promise.resolve(null)).then((key) => {
       if (!key) return next(new AppError(401, "unauthorized", "send a valid, unrevoked agent key as 'Authorization: Bearer ap_agent_...'"));
       req.agentKey = key;
-      next();
+      // The kill switch: while the owner has frozen everything, agents can do nothing at all.
+      frozenAt(db, key.userId).then((frozen) => next(frozen ? frozenError() : undefined), next);
     }, next);
   };
 
@@ -386,7 +396,7 @@ export function createApp(db: Db) {
         tool: tool.slug,
         amountCents,
         units,
-        needsApproval: key.approvalThresholdCents !== null && amountCents > key.approvalThresholdCents,
+        ...(await decideCall(db, key, tool, amountCents).then((d) => ({ needsApproval: d.outcome === "approve", decision: d.outcome, why: d.reason }))),
         overPerCallMax: key.perCallMaxCents !== null && amountCents > key.perCallMaxCents,
         ...(await spendSummary(db, key)),
       };
@@ -402,6 +412,8 @@ export function createApp(db: Db) {
           input: z.record(z.string(), z.unknown()).default({}),
           idempotencyKey: z.string().min(1).max(200),
           approvalId: z.uuid().optional(),
+          reason: z.string().max(500).optional(),
+          instruction: z.string().max(500).optional(),
         }),
         req.body,
       );
@@ -455,6 +467,8 @@ export function createApp(db: Db) {
   app.use("/api/grocery", ownerOnly, groceryRoutes(db, "owner"));
   app.use("/api/agent/grocery", agentOnly, groceryRoutes(db, "agent"));
   app.use("/api/permissions", ownerOnly, permissionsRoutes(db, "owner"));
+  app.use("/api/agent/controls", agentOnly, agentControlsRoutes(db));
+  app.use("/api/controls", ownerOnly, controlsRoutes(db));
   app.use("/api/agent/permissions", agentOnly, permissionsRoutes(db, "agent"));
 
   // ------------------------------------------------------------ demo provider + dashboard
@@ -496,6 +510,9 @@ export function startJobs(db: Db) {
       if (config.keepaApiKey) await refreshFromKeepa(db, config.keepaApiKey);
       const released = await sweepExpiredHolds(db);
       if (released) console.log(`released ${released} expired hold(s)`);
+      const closed = await sweepEnvelopes(db);
+      if (closed) console.log(`closed ${closed} expired envelope(s)`);
+      await releaseVaultUnlocks(db);
       for (const o of await renewDueSubscriptions(db)) console.log(`subscription ${o.subscriptionId}: ${o.outcome}${o.reason ? ` (${o.reason})` : ""}`);
     } catch (err) {
       console.error("background job failed", err);

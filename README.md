@@ -37,7 +37,7 @@ All amounts are integer cents in an append-only, double-entry ledger. A balance 
 A paid call:
 
 1. **Quote**: price per call, or price × units for per-unit tools.
-2. **Checks**: tool allowlist, per-call maximum, and approval threshold (above it, the agent gets `pending_approval` and retries with the `approvalId` once the owner approves).
+2. **Checks**: restricted categories, tool allowlist, per-call maximum, then the agent's level and rules decide: pay, pay and flag for review, or ask the owner (the agent gets `pending_approval` with the reason, and retries with the `approvalId` once the owner approves). See [Owner controls](#owner-controls).
 3. **Hold**: under a lock on the wallet, check the 24h and 30-day caps and the balance, then move the price into escrow. Two parallel calls can never both spend the same money.
 4. **Call** the provider: `POST {callId, input}` with the provider's `Authorization` header.
 5. **Settle**:
@@ -88,7 +88,7 @@ Try it with the demo: `npm run seed:maria` creates Maria (Netflix, Apple TV+, Pa
 
 ## Price watch
 
-Paste a product link (Amazon or any store) and a target price. AgentPay **never scrapes stores, signs in to them, or buys**.
+Paste a product link (Amazon or any store) and a target price. AgentPay **never scrapes stores, signs in to them, or buys**. Your agent buys only under a buy mandate you signed (see [Owner controls](#owner-controls)).
 
 - **Where prices come from.**
   - The owner's agent reads the page in the owner's own browser and calls `record_price`.
@@ -126,14 +126,88 @@ Try it with `examples/grocery-list.png`.
 
 It never picks a different product, so carrot cake is out, and it reports what it skipped and why.
 
+## Owner controls
+
+Ideas from agent payments in Asia ([docs/asia.md](docs/asia.md)), built for one owner and all their agents.
+
+- **Levels.** Each agent key has a level:
+  - **L0, ask** (`ask`): every paid call needs your passkey.
+  - **L1, rules** (`rules`): calls go through only when one of your rules covers them. A rule names tools (or any), a maximum per call, and whether matching calls simply pay (`auto`) or pay and get flagged for you to review (`observe`). Anything else asks.
+  - **L2, budget** (`budget`): the original behaviour. Calls pay on their own within the caps and below the approval threshold.
+  - On any level, calls above **observe above** pay but are flagged on the Control tab, and the approval threshold always asks.
+- **Safety checks** that turn "pay" into "ask":
+  - **Cooling-off**: a new key pays at most `COOLING_OFF_AUTO_MAX_CENTS` per call on its own for its first `COOLING_OFF_HOURS`.
+  - **Drain guard**: asks when one agent's last hour of spending would be more than half the wallet (and over `DRAIN_GUARD_MIN_CENTS`).
+- **Envelopes.** Money moved out of the wallet for one agent (or any), for some tools (or any), until a date (at most 90 days).
+  - You approve it with your passkey, and calls it covers are then paid from it without asking again.
+  - Per-call limits and caps still apply.
+  - Close it any time; when it ends, what's left returns to the wallet.
+  - Agents can ask for one (`request_envelope`).
+- **Kill switch.** "Freeze everything" needs no passkey. At once:
+  - every agent request is refused (HTTP 423)
+  - pending approvals are declined
+  - AgentPay plan renewals wait
+
+  Unfreezing is a passkey approval.
+- **Vault.** Money you lock in the vault can't be spent by any agent or approval. Getting it back takes a passkey approval, then a wait (`VAULT_UNLOCK_DELAY_HOURS`, 24 by default), which you can cancel.
+- **Final confirmation.** Every approval shows the "before you approve" terms under its summary: per-period and 12-month cost, renewal, the price ceiling, how to cancel, and what it can't enforce. The terms are bound into the passkey challenge together with the summary.
+- **Renewals and price rises.**
+  - Every renewal and trial reminder has a one-tap **Cancel…**, which starts `request_cancel`.
+  - When an everyday subscription's price goes up and you didn't type the new price yourself, it waits for your decision: **Keep new price** or **Cancel…**.
+- **Buy mandates.** "Buy this when it drops under $40, at most one, on target.com, until Dec 1", signed with your passkey.
+  - Right before checkout, the agent calls `check_buy_mandate` with the price and site. It also needs a browser permission to check out on that site.
+  - Recording the purchase uses up the mandate. A price above it is recorded as an incident.
+  - AgentPay doesn't pay the store, so this is a rule the agent follows, checked afterwards, until AgentPay cards can refuse the charge themselves.
+- **Purpose on permissions.** Browser permissions can carry a purpose ("weekly groceries"), shown on the approval and kept with the permission.
+- **Why log.** Every paid call (paid, flagged, asked, refused), approval, browser action, envelope, vault move and freeze is logged in one list per owner.
+  - Each entry has the owner's instruction, the agent's reason, AgentPay's reason and the result.
+  - The list is append-only and hash-chained: **Verify chain** on the Control tab recomputes it and names the first entry that was changed or removed.
+- **Incidents.** You or the agent can record an incident, and flagged calls can be reported from the review list. Each incident gets one of four kinds:
+  - **misjudgment**: a mistake within the authority given
+  - **condition_breach**: the agent went past a limit
+  - **system_bug**
+  - **hijacked**: a stolen key or prompt injection
+
+  The guarantee policy says what AgentPay would refund. It offers nothing until `GUARANTEE_MAX_CENTS` is set, which is a legal and financial decision, not a code one. AgentPay has no refund payout step yet; incidents are records.
+- **One board.** The Control tab lists everything that can spend your money, each with a Stop button:
+  - agents with their levels
+  - envelopes and the vault
+  - browser permissions and buy mandates
+  - every subscription
+  - calls to review, open incidents and reminders
+
+## What agents refuse
+
+Agents never buy, pay for, add to a cart, or act on websites for:
+- pornography and adult content
+- medicines (prescription and over the counter), pharmacies and medical devices
+- firearms, ammunition and weapons
+- controlled or illegal drugs
+- alcohol
+- tobacco, nicotine and vaping
+- gambling
+
+The owner can't turn this off; they buy these themselves.
+
+- **Where it's enforced:**
+  - listing a tool or plan
+  - a paid call
+  - subscribing
+  - watching a price and signing a buy mandate
+  - picking a product
+  - grocery items: a restricted item stays on the list as **refused** and can't be put in the cart
+  - browser permissions: pharmacy, liquor, gun, adult, vape and gambling sites, by a list of known stores and words in the site name (e.g. `walgreens.com`, `cvs.com`, `totalwine.com`, `…pharmacy.com`)
+- **The agent also refuses on its own.** The MCP instructions say so, and `check_purchase_policy` checks anything it's unsure about.
+- **Matching is by words**, so it can miss things. It errs toward refusing, for example non-alcoholic beer, and leaves everyday items such as root beer, wine vinegar, kale and glue guns alone. See `src/policy.ts`.
+
 ## MCP tools
 
 | Tool | What it does |
 |---|---|
 | `list_paid_tools` | Tools this key may call, with prices and input schemas |
-| `get_quote` | Price, whether approval is needed, remaining budget |
-| `call_paid_tool` | Pay for and run a call |
-| `get_balance` | Wallet, recent spend, limits |
+| `get_quote` | Price, whether approval is needed and why, remaining budget |
+| `call_paid_tool` | Pay for and run a call, with the agent's reason and the owner's instruction |
+| `get_balance` | Wallet, recent spend, limits, level, rules, envelopes, frozen or not |
 | `check_approval` | Status of a pending approval |
 | `browse_plans` | Catalog plus personalised savings suggestions |
 | `subscribe` / `renew_subscription` | Request a subscription or renewal (owner approves with a passkey) |
@@ -144,10 +218,14 @@ It never picks a different product, so carrot cake is out, and it reports what i
 | `savings_ideas` | Bundles, cheaper tiers, unused services and more |
 | `cancel_guide` / `request_cancel` / `mark_canceled` | Cancel safely, with the owner's approval |
 | `watch_price` / `list_price_watches` / `record_price` / `mark_bought` / `stop_watch` | Wait for a sale |
+| `request_buy_mandate` / `check_buy_mandate` | Buy a watched item only within a mandate the owner signed |
 | `create_grocery_list` (items, text or photo) / `get_grocery_list` / `list_grocery_lists` / `set_grocery_store` | Grocery lists |
 | `update_grocery_item` / `request_order_approval` / `mark_grocery_ordered` | Fill the cart, get approval, record the order |
 | `check_browser_access` / `request_browser_access` / `log_browser_activity` | Act in the owner's signed-in browser only with permission |
 | `pick_product` / `get_shopping_preferences` | Choose among versions of an item |
+| `check_purchase_policy` | Is this item, tool or site something agents must refuse? |
+| `request_envelope` | Ask the owner to set money aside for this agent |
+| `report_mistake` | Record an incident the agent caused |
 
 ## Configuration
 
@@ -159,6 +237,10 @@ It never picks a different product, so carrot cake is out, and it reports what i
 | `PLATFORM_FEE_BPS` | `1000` | Platform cut, 1000 = 10% |
 | `REQUIRE_PASSKEY` | `true` | When `false`, owners without a passkey can approve with just their token |
 | `ALLOW_DEV_CREDIT` | `false` | Free test credits from the dashboard. Never in production |
+| `COOLING_OFF_HOURS` / `COOLING_OFF_AUTO_MAX_CENTS` | `12` / `100` | A new agent key only pays calls up to this much on its own for its first hours |
+| `DRAIN_GUARD` / `DRAIN_GUARD_MIN_CENTS` | `true` / `2000` | Ask when an hour of one agent's spending would be more than half the wallet |
+| `VAULT_UNLOCK_DELAY_HOURS` | `24` | Wait between approving a vault unlock and the money moving |
+| `GUARANTEE_MAX_CENTS` | `0` | Refund guarantee per incident. 0 = none offered |
 
 ## Not production-ready yet
 

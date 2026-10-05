@@ -106,12 +106,12 @@ export async function finishRegistration(db: Db, userId: string, response: Regis
 
 /**
  * The challenge for approving something is derived from what is being
- * approved, plus randomness. The signed challenge is then a record that the
+ * approved (summary and final-confirmation terms), plus randomness. The signed challenge is then a record that the
  * owner, on their own device, agreed to exactly this approval and amount.
  */
-function approvalChallenge(approval: { id: string; amountCents: number; summary: string }): string {
+function approvalChallenge(approval: { id: string; amountCents: number; summary: string; terms?: string[] }): string {
   return createHash("sha256")
-    .update(JSON.stringify({ approval: approval.id, amountCents: approval.amountCents, summary: approval.summary }))
+    .update(JSON.stringify({ approval: approval.id, amountCents: approval.amountCents, summary: approval.summary, terms: approval.terms ?? [] }))
     .update(randomBytes(16))
     .digest("base64url");
 }
@@ -119,7 +119,7 @@ function approvalChallenge(approval: { id: string; amountCents: number; summary:
 export async function startApprovalSignature(
   db: Db,
   userId: string,
-  approval: { id: string; amountCents: number; summary: string },
+  approval: { id: string; amountCents: number; summary: string; terms?: string[] },
 ) {
   const { rows } = await db.query("SELECT id, transports FROM passkeys WHERE user_id = $1", [userId]);
   if (!rows.length) throw new AppError(400, "no_passkey", "register a passkey before approving");

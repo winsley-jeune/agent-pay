@@ -2,6 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 import type { Db, Tx } from "./db.js";
 import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
+import { config } from "./config.js";
+import type { Level, SpendRule } from "./controls.js";
 import { createAccount } from "./ledger.js";
 
 export function hashToken(token: string): string {
@@ -53,6 +55,10 @@ export interface AgentKey {
   monthlyCapCents: number | null;
   approvalThresholdCents: number | null;
   allowedToolSlugs: string[] | null;
+  level: Level;
+  spendRules: SpendRule[];
+  observeAboveCents: number | null;
+  coolingOffUntil: Date | null;
   revokedAt: Date | null;
   createdAt: Date;
 }
@@ -63,12 +69,16 @@ export interface AgentKeyLimits {
   monthlyCapCents?: number | null;
   approvalThresholdCents?: number | null;
   allowedToolSlugs?: string[] | null;
+  level?: Level;
+  spendRules?: SpendRule[];
+  observeAboveCents?: number | null;
 }
 
 const agentKeyColumns = `k.id, k.user_id AS "userId", k.name, k.key_prefix AS "keyPrefix", a.id AS "walletAccountId",
   k.per_call_max_cents AS "perCallMaxCents", k.daily_cap_cents AS "dailyCapCents",
   k.monthly_cap_cents AS "monthlyCapCents", k.approval_threshold_cents AS "approvalThresholdCents",
-  k.allowed_tool_slugs AS "allowedToolSlugs", k.revoked_at AS "revokedAt", k.created_at AS "createdAt"`;
+  k.allowed_tool_slugs AS "allowedToolSlugs", k.level, k.spend_rules AS "spendRules", k.observe_above_cents AS "observeAboveCents",
+  k.cooling_off_until AS "coolingOffUntil", k.revoked_at AS "revokedAt", k.created_at AS "createdAt"`;
 
 const agentKeyFrom = `agent_keys k JOIN accounts a ON a.owner_id = k.user_id AND a.kind = 'wallet'`;
 
@@ -78,7 +88,12 @@ const limitColumns: Record<keyof AgentKeyLimits, string> = {
   monthlyCapCents: "monthly_cap_cents",
   approvalThresholdCents: "approval_threshold_cents",
   allowedToolSlugs: "allowed_tool_slugs",
+  level: "level",
+  spendRules: "spend_rules",
+  observeAboveCents: "observe_above_cents",
 };
+
+const columnValue = (field: keyof AgentKeyLimits, v: unknown) => (field === "spendRules" ? JSON.stringify(v ?? []) : v);
 
 export async function createAgentKey(
   db: Db,
@@ -89,8 +104,10 @@ export async function createAgentKey(
   const key = newToken("ap_agent");
   const { rows } = await db.query(
     `INSERT INTO agent_keys (user_id, name, key_prefix, key_hash, per_call_max_cents, daily_cap_cents,
-                             monthly_cap_cents, approval_threshold_cents, allowed_tool_slugs)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+                             monthly_cap_cents, approval_threshold_cents, allowed_tool_slugs, level, spend_rules,
+                             observe_above_cents, cooling_off_until)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+             CASE WHEN $13::int > 0 THEN now() + make_interval(hours => $13::int) END) RETURNING id`,
     [
       userId,
       name,
@@ -101,6 +118,11 @@ export async function createAgentKey(
       limits.monthlyCapCents ?? null,
       limits.approvalThresholdCents ?? null,
       limits.allowedToolSlugs ?? null,
+      limits.level ?? "budget",
+      JSON.stringify(limits.spendRules ?? []),
+      limits.observeAboveCents ?? null,
+      // A new key starts in a cooling-off period.
+      config.coolingOffHours,
     ],
   );
   const agentKey = await agentKeyById(db, rows[0].id);
@@ -133,7 +155,7 @@ export async function updateAgentKeyLimits(db: Db, userId: string, id: string, l
   const values: unknown[] = [];
   for (const [field, column] of Object.entries(limitColumns) as [keyof AgentKeyLimits, string][]) {
     if (limits[field] !== undefined) {
-      values.push(limits[field]);
+      values.push(columnValue(field, limits[field]));
       sets.push(`${column} = $${values.length}`);
     }
   }

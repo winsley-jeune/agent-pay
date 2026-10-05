@@ -2,11 +2,16 @@ import type { AgentKey } from "./auth.js";
 import type { Db, Tx } from "./db.js";
 import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
+import { reportIncidentTx } from "./incidents.js";
+import { useMandate } from "./mandates.js";
+import { normalizeSite } from "./permissions.js";
+import { enforce, enforceSite } from "./policy.js";
 
 // Watch an item until it drops to a target price. Prices come from the
 // owner's agent (which reads the page in the owner's own browser), from the
 // owner, or optionally from the Keepa price-history API. AgentPay never logs
-// in to a store, never scrapes it, and never buys.
+// in to a store, never scrapes it, and never buys. An agent may buy only
+// under a buy mandate the owner signed (src/mandates.ts).
 
 export type WatchStatus = "watching" | "target_hit" | "bought" | "stopped";
 
@@ -90,6 +95,9 @@ export async function addWatch(
 ) {
   if (!Number.isSafeInteger(input.targetPriceCents) || input.targetPriceCents <= 0) throw new AppError(400, "invalid_price", "targetPriceCents must be a positive integer");
   const { url, retailer, productKey } = parseProductUrl(input.url);
+  // Agents can't buy these, so there's nothing to watch for them either.
+  enforce(input.title, url);
+  enforceSite(normalizeSite(url));
   const title = input.title?.trim() || (productKey ? `Amazon item ${productKey}` : url);
   const { rows } = await db
     .query(
@@ -227,13 +235,29 @@ export async function updateWatch(db: Db, userId: string, id: string, input: { t
   return getWatch(db, userId, id);
 }
 
-export async function markBought(db: Db, userId: string, id: string, priceCents?: number) {
+/**
+ * Record that the item was bought. If a buy mandate covered it, the mandate is
+ * used up, and an agent purchase above the mandate's limit is recorded as an incident.
+ */
+export async function markBought(db: Db, userId: string, id: string, priceCents?: number, agentKey: AgentKey | null = null) {
   const w = await getWatch(db, userId, id);
   if (w.status === "bought") throw new AppError(409, "already_bought", "already marked as bought");
-  await db.query("UPDATE price_watches SET status = 'bought', bought_at = now(), bought_price_cents = $3 WHERE id = $1 AND user_id = $2", [
-    id, userId, priceCents ?? w.currentPriceCents,
-  ]);
-  return getWatch(db, userId, id);
+  const paid = priceCents ?? w.currentPriceCents;
+  if (agentKey && paid == null) throw new AppError(400, "price_required", "give the price you actually paid (priceCents)");
+  const mandate = await withTx(db, async (tx) => {
+    await tx.query("UPDATE price_watches SET status = 'bought', bought_at = now(), bought_price_cents = $3 WHERE id = $1 AND user_id = $2", [id, userId, paid]);
+    const used = await useMandate(tx, userId, id, paid, agentKey?.id ?? null);
+    if (used && !used.within && agentKey) {
+      await reportIncidentTx(
+        tx, userId,
+        { kind: "condition_breach", agentKeyId: agentKey.id, amountCents: paid === null ? 0 : Math.max(0, paid - used.maxPriceCents),
+          description: `${w.title} was bought for ${paid === null ? "an unknown price" : usd(paid)}, above the mandate's ${usd(used.maxPriceCents)} limit` },
+        "agent",
+      );
+    }
+    return used;
+  });
+  return { ...(await getWatch(db, userId, id)), mandate };
 }
 
 export async function stopWatch(db: Db, userId: string, id: string) {
