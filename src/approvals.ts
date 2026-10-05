@@ -203,11 +203,25 @@ export async function approvalStatusForAgent(db: Db, agentKey: AgentKey, id: str
   let message: string | undefined;
   if (a.status === "pending" && a.needsCosign) {
     message = a.ownerSignedAt
-      ? `The owner approved. This is a protected account, so it also needs a trusted helper's signature, or it goes through on ${new Date(a.cosignDueAt).toISOString()} unless a helper objects. Wait; don't ask the owner to approve again.`
+      ? a.cosignDueAt
+        ? `The owner approved. This is a protected account, so it also needs a trusted helper's signature, or it goes through on ${new Date(a.cosignDueAt).toISOString()} unless a helper objects. Wait; don't ask the owner to approve again.`
+        : "The owner approved, but a trusted helper has to review it first. Wait; don't ask the owner again or urge them to hurry."
       : "Waiting for the owner. This is a protected account: after the owner approves, it also needs a helper's signature or a waiting period.";
   }
   return { ...a, ...(message ? { message } : {}) };
 }
+
+/**
+ * Asked before the owner signs a big or sensitive approval on a protected
+ * account (payment apps in China ask this; Japanese bank tellers are trained
+ * to). Scammers phone their targets, demand secrecy and create urgency.
+ */
+export const SCAM_QUESTIONS = {
+  calledYou: "Did someone phone, text or message you and ask you to do this?",
+  keepSecret: "Were you told to keep it secret, or not to tell your family or bank?",
+  urgent: "Were you told it has to happen right now, or something bad will happen?",
+} as const;
+export type ScamAnswers = Record<keyof typeof SCAM_QUESTIONS, boolean>;
 
 /** Load an approval for someone who may act on it: its owner, or a trusted helper on the owner's account. */
 async function approvalForSigner(q: Db | Tx, signerId: string, id: string, lock = false) {
@@ -238,7 +252,8 @@ export async function startApproval(db: Db, signerId: string, id: string) {
   const summary = describeApproval(approval);
   const terms = approvalTerms(approval);
   const options = await startApprovalSignature(db, signerId, { id, amountCents: approval.amountCents, summary, terms });
-  return { summary, terms, options, signingAs: role };
+  const askScam = role === "owner" && !(approval as any).ownerSignedAt && needsCosign(await getProtection(db, row.ownerId), approval.kind, approval.amountCents);
+  return { summary, terms, options, signingAs: role, ...(askScam ? { scamCheck: SCAM_QUESTIONS } : {}) };
 }
 
 /**
@@ -256,11 +271,16 @@ export async function approve(
   signerId: string,
   id: string,
   passkeyResponse?: AuthenticationResponseJSON,
-  opts: { requirePasskey?: boolean } = {},
+  opts: { requirePasskey?: boolean; scamCheck?: ScamAnswers } = {},
 ) {
   const requirePasskey = opts.requirePasskey ?? config.requirePasskey;
   return withTx(db, async (tx) => {
     const { approval, role, helperLabel } = await approvalForSigner(tx, signerId, id, true);
+    const cosignNeeded = role === "owner" && needsCosign(await getProtection(tx, approval.ownerId), approval.kind, approval.amountCents);
+    const answers = opts.scamCheck;
+    if (cosignNeeded && !approval.ownerSignedAt && (!answers || Object.keys(SCAM_QUESTIONS).some((k) => typeof (answers as any)[k] !== "boolean"))) {
+      throw new AppError(400, "scam_check_required", "answer the three safety questions before approving", { questions: SCAM_QUESTIONS });
+    }
     if (approval.status !== "pending") throw new AppError(409, "not_pending", `this approval is already ${approval.status}`);
     const ownerId: string = approval.ownerId;
 
@@ -278,20 +298,37 @@ export async function approve(
     }
     if (!cosign) return applyApproval(tx, approval, ownerId, passkeyId, "owner");
 
+    let flagged = false;
     if (role === "owner") {
+      flagged = !!answers && Object.values(answers).some(Boolean);
+      const helpers = flagged ? (await tx.query("SELECT count(*)::int AS n FROM helpers WHERE owner_id = $1 AND status IN ('active','removing')", [ownerId])).rows[0].n : 0;
+      // A "yes" with helpers: only a helper's signature, given after this, lets it through. Without helpers, the waiting period still applies.
+      const helperOnly = flagged && helpers > 0;
       await tx.query(
-        `UPDATE approvals SET needs_cosign = true, owner_signed_at = now(), owner_passkey_id = $2,
-                cosign_due_at = COALESCE(cosign_due_at, now() + make_interval(hours => $3)) WHERE id = $1`,
-        [id, passkeyId, protection.cosignDelayHours],
+        `UPDATE approvals SET needs_cosign = true, owner_signed_at = now(), owner_passkey_id = $2, scam_answers = $4, scam_flagged = $5,
+                cosign_due_at = CASE WHEN $6 THEN NULL ELSE COALESCE(cosign_due_at, now() + make_interval(hours => $3)) END,
+                helper_signed_by = CASE WHEN $5 THEN NULL ELSE helper_signed_by END,
+                helper_signed_at = CASE WHEN $5 THEN NULL ELSE helper_signed_at END
+          WHERE id = $1`,
+        [id, passkeyId, protection.cosignDelayHours, answers ? JSON.stringify(answers) : null, flagged, helperOnly],
       );
-      if (approval.helperSignedAt) return applyApproval(tx, { ...approval, ownerPasskeyId: passkeyId }, ownerId, passkeyId, "owner and helper");
+      if (flagged) {
+        await auditTx(tx, ownerId, {
+          actor: "owner", kind: "scam_check_flagged",
+          summary: `Possible scam: the owner said yes to a safety question before approving ${approval.kind.replaceAll("_", " ")}${approval.amountCents ? ` for $${(approval.amountCents / 100).toFixed(2)}` : ""}`,
+          result: helperOnly ? "held until a trusted helper reviews it" : "no helpers: held for the waiting period",
+          data: { approvalId: id, answers },
+        });
+      } else if (approval.helperSignedAt) {
+        return applyApproval(tx, { ...approval, ownerPasskeyId: passkeyId }, ownerId, passkeyId, "owner and helper");
+      }
     } else {
       await tx.query("UPDATE approvals SET needs_cosign = true, helper_signed_by = $2, helper_signed_at = now(), helper_passkey_id = $3 WHERE id = $1", [id, signerId, passkeyId]);
       if (approval.ownerSignedAt) return applyApproval(tx, approval, ownerId, approval.ownerPasskeyId, "owner and helper");
     }
     const { rows } = await tx.query(`SELECT cosign_due_at AS "dueAt" FROM approvals WHERE id = $1`, [id]);
     const dueAt: Date | null = rows[0].dueAt;
-    const waitingFor = role === "owner" ? "helper_or_delay" : "owner";
+    const waitingFor = role === "owner" ? (dueAt ? "helper_or_delay" : "helper") : "owner";
     await auditTx(tx, ownerId, {
       actor: role, kind: "cosign_waiting",
       summary: `${role === "owner" ? "Owner" : helperLabel} signed: ${approval.kind.replaceAll("_", " ")} ${approval.amountCents ? `for $${(approval.amountCents / 100).toFixed(2)}` : ""}`.trim(),
@@ -303,7 +340,9 @@ export async function approve(
       message:
         waitingFor === "owner"
           ? "Your co-signature is recorded. It takes effect once the owner approves."
-          : `Signed. This is a protected account: it takes effect when a trusted helper co-signs, or on ${dueAt?.toISOString()} if no helper objects.`,
+          : waitingFor === "helper"
+            ? "This has the signs of a scam, so a trusted helper has to look at it first. Talk to them before doing anything else. Real banks, police and companies never ask you to keep a payment secret or to hurry."
+            : `Signed. This is a protected account: it takes effect when a trusted helper co-signs, or on ${dueAt?.toISOString()} if no helper objects.${flagged ? " Because you answered yes to a safety question, please talk to someone you trust before then." : ""}`,
     };
   });
 }

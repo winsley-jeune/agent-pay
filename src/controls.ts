@@ -101,8 +101,8 @@ export async function decideCall(q: Db | Tx, agentKey: AgentKey, tool: Tool, amo
       : { outcome: "auto", reason, envelopeId };
   const ask = (reason: string): Decision => ({ outcome: "approve", reason, envelopeId: null });
 
-  // Money the owner already set aside with a passkey is pre-approved for this agent and tool.
-  const envelope = await findEnvelopeFor(q, agentKey, tool, amountCents);
+  // Money the owner already set aside with a passkey is pre-approved for this agent and tool (never for test keys: envelopes hold real money).
+  const envelope = agentKey.test ? null : await findEnvelopeFor(q, agentKey, tool, amountCents);
   if (envelope) return observe(`paid from envelope "${envelope.name}"`, envelope.id);
 
   if (agentKey.level === "ask") return ask("this agent asks before every paid call");

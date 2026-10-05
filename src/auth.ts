@@ -4,7 +4,7 @@ import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
 import { config } from "./config.js";
 import type { Level, SpendRule } from "./controls.js";
-import { createAccount } from "./ledger.js";
+import { createAccount, post, systemAccount } from "./ledger.js";
 
 export function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
@@ -69,6 +69,8 @@ export interface AgentKey {
   spendRules: SpendRule[];
   observeAboveCents: number | null;
   coolingOffUntil: Date | null;
+  /** A test key (ap_test_...) spends pretend money from the owner's test wallet; nothing real moves. */
+  test: boolean;
   revokedAt: Date | null;
   createdAt: Date;
 }
@@ -82,17 +84,31 @@ export interface AgentKeyLimits {
   level?: Level;
   spendRules?: SpendRule[];
   observeAboveCents?: number | null;
+  test?: boolean;
 }
 
 const agentKeyColumns = `k.id, k.user_id AS "userId", k.name, k.key_prefix AS "keyPrefix", a.id AS "walletAccountId",
   k.per_call_max_cents AS "perCallMaxCents", k.daily_cap_cents AS "dailyCapCents",
   k.monthly_cap_cents AS "monthlyCapCents", k.approval_threshold_cents AS "approvalThresholdCents",
   k.allowed_tool_slugs AS "allowedToolSlugs", k.level, k.spend_rules AS "spendRules", k.observe_above_cents AS "observeAboveCents",
-  k.cooling_off_until AS "coolingOffUntil", k.revoked_at AS "revokedAt", k.created_at AS "createdAt"`;
+  k.cooling_off_until AS "coolingOffUntil", k.test, k.revoked_at AS "revokedAt", k.created_at AS "createdAt"`;
 
-const agentKeyFrom = `agent_keys k JOIN accounts a ON a.owner_id = k.user_id AND a.kind = 'wallet'`;
+// A test key's wallet is the owner's test wallet, so it can never touch real money.
+const agentKeyFrom = `agent_keys k JOIN accounts a ON a.owner_id = k.user_id AND a.kind = CASE WHEN k.test THEN 'test_wallet' ELSE 'wallet' END`;
 
-const limitColumns: Record<keyof AgentKeyLimits, string> = {
+/** Starting pretend balance for a new test wallet. */
+export const TEST_WALLET_START_CENTS = 10_000;
+
+/** The owner's test wallet, created with pretend credits the first time. */
+export async function ensureTestWallet(tx: Tx, userId: string): Promise<string> {
+  const { rows } = await tx.query("SELECT id FROM accounts WHERE owner_id = $1 AND kind = 'test_wallet'", [userId]);
+  if (rows[0]) return rows[0].id;
+  const id = await createAccount(tx, "test_wallet", userId);
+  await post(tx, "test", [{ accountId: await systemAccount(tx, "test_sink"), amountCents: -TEST_WALLET_START_CENTS }, { accountId: id, amountCents: TEST_WALLET_START_CENTS }], "test wallet: pretend credits");
+  return id;
+}
+
+const limitColumns: Record<Exclude<keyof AgentKeyLimits, "test">, string> = {
   perCallMaxCents: "per_call_max_cents",
   dailyCapCents: "daily_cap_cents",
   monthlyCapCents: "monthly_cap_cents",
@@ -111,13 +127,14 @@ export async function createAgentKey(
   name: string,
   limits: AgentKeyLimits = {},
 ): Promise<{ agentKey: AgentKey; key: string }> {
-  const key = newToken("ap_agent");
+  const key = newToken(limits.test ? "ap_test" : "ap_agent");
+  if (limits.test) await withTx(db, (tx) => ensureTestWallet(tx, userId));
   const { rows } = await db.query(
     `INSERT INTO agent_keys (user_id, name, key_prefix, key_hash, per_call_max_cents, daily_cap_cents,
                              monthly_cap_cents, approval_threshold_cents, allowed_tool_slugs, level, spend_rules,
-                             observe_above_cents, cooling_off_until)
+                             observe_above_cents, cooling_off_until, test)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-             CASE WHEN $13::int > 0 THEN now() + make_interval(hours => $13::int) END) RETURNING id`,
+             CASE WHEN $13::int > 0 AND NOT $14 THEN now() + make_interval(hours => $13::int) END, $14) RETURNING id`,
     [
       userId,
       name,
@@ -131,8 +148,9 @@ export async function createAgentKey(
       limits.level ?? "budget",
       JSON.stringify(limits.spendRules ?? []),
       limits.observeAboveCents ?? null,
-      // A new key starts in a cooling-off period.
+      // A new key starts in a cooling-off period (test keys don't need one).
       config.coolingOffHours,
+      !!limits.test,
     ],
   );
   const agentKey = await agentKeyById(db, rows[0].id);

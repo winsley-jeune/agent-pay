@@ -101,7 +101,7 @@ async function api(method, path, body, opts = {}) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(json.error?.message || "HTTP " + res.status);
+  if (!res.ok) throw Object.assign(new Error(json.error?.message || "HTTP " + res.status), { code: json.error?.code, details: json.error?.details });
   return json;
 }
 const act = (fn) => async (e) => { const b = e?.currentTarget; if (b) b.disabled = true; try { await fn(e); } catch (err) { toast(err.message); } finally { if (b) b.disabled = false; } };
@@ -242,6 +242,13 @@ async function board() {
     </table></div></div>` : ""}
     ${b.reminders.length ? `<div class="card"><h3>Coming up</h3>${b.reminders.map((r) => `<div class="suggestion spread" style="border-color:var(--warn)"><div>${esc(r.message)}<div class="small muted">${esc(r.on)} · ${r.daysLeft} days</div></div>
       <div class="row">${acting ? "" : r.actions.includes("request_cancel") ? `<button data-rcancel="${esc(r.subscriptionId)}">Cancel…</button>` : ""}${acting || !r.actions.includes("accept_price") ? "" : `<button data-accept="${esc(r.subscriptionId)}">Keep new price</button>`}</div></div>`).join("")}</div>` : ""}
+    ${b.openPurchases?.length ? `<div class="card"><h3>Orders</h3><p class="small muted">Each order stays open until you confirm what arrived. Return dates follow the store's usual policy; correct them if yours differs.</p>
+      ${b.purchaseReminders.map((r) => `<div class="suggestion" style="border-color:var(--warn)">${esc(r.message)}</div>`).join("")}
+      <div class="table-wrap"><table><tr><th>Order</th><th>Store</th><th class="num">Total</th><th>Return by</th><th>Status</th><th></th></tr>
+      ${b.openPurchases.map((p) => `<tr><td>${esc(p.title)}${p.orderNumber ? `<div class="small muted">#${esc(p.orderNumber)}</div>` : ""}${p.missingItems?.length ? `<div class="small" style="color:var(--bad)">Missing: ${esc(p.missingItems.join(", "))}</div>` : ""}</td>
+        <td>${esc(p.store)}</td><td class="num">${p.totalCents != null ? usd(p.totalCents) : ""}</td><td>${esc(p.returnBy)} <span class="small muted">(${p.daysLeft} days)</span></td><td>${stateChip(p.status)}</td>
+        <td class="row">${acting ? "" : `${p.status === "ordered" ? `<button data-arrived="${esc(p.id)}">Everything arrived</button><button data-missing="${esc(p.id)}">Something's missing</button>` : ""}<button data-returned="${esc(p.id)}">Returned</button><button data-returnby="${esc(p.id)}">Change date</button><button data-pclose="${esc(p.id)}">Close</button>`}</td></tr>`).join("")}
+      </table></div></div>` : ""}
     <div class="card"><h3>Everything that can spend your money</h3>
       <p class="small muted">${b.pendingApprovals ? `<a href="#approvals">${b.pendingApprovals} waiting for approval</a> · ` : ""}Subscriptions ${usd(b.subscriptionTotals.monthlyCents)}/month (${usd(b.subscriptionTotals.yearlyCents)} a year)</p>
       ${group("Agents", ["Agent", "Level", "Spent", "Limits"], b.agents.map((a) => `<tr><td><b>${esc(a.name)}</b>${a.coolingOffUntil ? `<div class="small" style="color:var(--warn)">cooling off until ${date(a.coolingOffUntil)}</div>` : ""}</td>
@@ -312,6 +319,19 @@ async function board() {
     toast("Stopped."); await refreshCounts(); board();
   })));
   el.querySelectorAll("[data-review-ok]").forEach((btn) => (btn.onclick = act(async () => { await api("POST", `/api/controls/reviews/${btn.dataset.reviewOk}`, { ok: true }); await refreshCounts(); board(); })));
+  el.querySelectorAll("[data-arrived]").forEach((btn) => (btn.onclick = act(async () => { await api("POST", `/api/purchases/${btn.dataset.arrived}/received`, {}); toast("Marked as received."); board(); })));
+  el.querySelectorAll("[data-missing]").forEach((btn) => (btn.onclick = act(async () => {
+    const what = prompt("What's missing or wrong? (separate items with commas)");
+    if (!what) return;
+    const r = await api("POST", `/api/purchases/${btn.dataset.missing}/received`, { missingItems: what.split(",").map((s) => s.trim()).filter(Boolean) });
+    toast(r.next ?? "Recorded."); board();
+  })));
+  el.querySelectorAll("[data-returned]").forEach((btn) => (btn.onclick = act(async () => { await api("POST", `/api/purchases/${btn.dataset.returned}/returned`, {}); board(); })));
+  el.querySelectorAll("[data-pclose]").forEach((btn) => (btn.onclick = act(async () => { await api("POST", `/api/purchases/${btn.dataset.pclose}/close`, {}); board(); })));
+  el.querySelectorAll("[data-returnby]").forEach((btn) => (btn.onclick = act(async () => {
+    const d = prompt("New last day to return (YYYY-MM-DD)");
+    if (d) { await api("PATCH", `/api/purchases/${btn.dataset.returnby}`, { returnBy: d }); board(); }
+  })));
   el.querySelectorAll("[data-review-bad]").forEach((btn) => (btn.onclick = act(async () => {
     const description = prompt("What went wrong?");
     if (description == null) return;
@@ -848,18 +868,36 @@ async function wallet() {
 // {status: "pending", message}. We show that message and return false (not done yet).
 const signedButWaiting = (r) => { if (r?.status !== "pending") return false; toast(r.message ?? "Signed. Waiting for the second signature."); return true; };
 
+// "Is someone on the phone with you?" Asked before the owner signs a big or sensitive approval on a protected account.
+function askScamQuestions(questions) {
+  const answers = {};
+  for (const [key, q] of Object.entries(questions)) answers[key] = confirm(`Safety question\n\n${q}\n\nOK = Yes    Cancel = No`);
+  if (Object.values(answers).some(Boolean)) {
+    alert("Thank you for answering honestly. This has the signs of a scam, so your trusted helper will look at it before anything happens.\n\nReal banks, police and companies never ask you to keep a payment secret or to hurry.");
+  }
+  return answers;
+}
+
 async function approveWithPasskey(id) {
   if (!me.hasPasskey && me.requirePasskey) {
     if (acting) { toast("Add a passkey in your own account first (My account › Passkeys)."); return false; }
     toast("Register a passkey first (Passkeys tab)."); location.hash = "security"; return false;
   }
-  if (!me.hasPasskey) return !signedButWaiting(await api("POST", `/api/approvals/${id}/approve`, {}));
-  const { summary, options, terms } = await api("POST", `/api/approvals/${id}/start`);
+  if (!me.hasPasskey) {
+    try {
+      return !signedButWaiting(await api("POST", `/api/approvals/${id}/approve`, {}));
+    } catch (err) {
+      if (err.code !== "scam_check_required") throw err;
+      return !signedButWaiting(await api("POST", `/api/approvals/${id}/approve`, { scamCheck: askScamQuestions(err.details.questions) }));
+    }
+  }
+  const { summary, options, terms, scamCheck: questions } = await api("POST", `/api/approvals/${id}/start`);
+  const scamCheck = questions ? askScamQuestions(questions) : undefined;
   // The final confirmation: every flow shows the full terms before the passkey prompt, not only the Approvals tab.
   if (!confirm(`${summary}\n\nBefore you approve:\n${(terms ?? []).map((t) => `• ${t}`).join("\n")}\n\nContinue to your passkey?`)) return false;
   toast("Confirm on your device: " + summary);
   const passkey = await startAuthentication({ optionsJSON: options });
-  return !signedButWaiting(await api("POST", `/api/approvals/${id}/approve`, { passkey }));
+  return !signedButWaiting(await api("POST", `/api/approvals/${id}/approve`, { passkey, scamCheck }));
 }
 
 // Kinds that always need a trusted helper's second signature on a protected account (mirrors the server).
@@ -989,7 +1027,8 @@ async function agents() {
     <div class="card"><h3>New agent key</h3>
       <p class="small muted">Give each agent its own key so you can see, limit and revoke it separately.</p>
       ${me.protection?.protectedAt ? `<p class="small" style="color:var(--warn)">This is a protected account: new agents start at L0 (ask for everything), and loosening an agent's limits waits ${esc(me.protection.cosignDelayHours)} hours.</p>` : ""}
-      <div class="grid" id="newkey"><label>Name<input name="name" value="Claude Code"></label>${limitInputs({ perCallMaxCents: 100, dailyCapCents: 500, approvalThresholdCents: 50 })}</div>
+      <div class="grid" id="newkey"><label>Name<input name="name" value="Claude Code"></label>
+        <label style="flex-direction:row;align-items:center;gap:8px;color:var(--text)"><input type="checkbox" name="test"> Test key (pretend money, for developers)</label>${limitInputs({ perCallMaxCents: 100, dailyCapCents: 500, approvalThresholdCents: 50 })}</div>
       <div class="row" style="margin-top:10px"><button class="primary" id="create">Create key</button></div><div id="created"></div>
     </div>
     ${agentKeys.map((k) => `<div class="card" data-key="${k.id}">
@@ -1006,7 +1045,8 @@ async function agents() {
   };
   $("#create").onclick = act(async () => {
     const scope = $("#newkey");
-    const r = await api("POST", "/api/agent-keys", { name: $("[name=name]", scope).value, ...readLimits(scope) });
+    const r = await api("POST", "/api/agent-keys", { name: $("[name=name]", scope).value, ...readLimits(scope), test: $("[name=test]", scope).checked || undefined });
+    if (r.agentKey?.test) toast("Test key: it spends pretend money from a test wallet, providers aren't paid, and it only covers paid tool calls.");
     const cfg = { mcpServers: { agentpay: { command: "npx", args: ["-y", "tsx", me.mcpScript], env: { AGENTPAY_URL: location.origin, AGENTPAY_AGENT_KEY: r.key } } } };
     $("#created").innerHTML = `<p class="small">Agent key (shown once):</p><pre>${esc(r.key)}</pre>
       <p class="small">Add it to Claude Code:</p><pre>claude mcp add agentpay --scope user -e AGENTPAY_URL=${esc(location.origin)} -e AGENTPAY_AGENT_KEY=${esc(r.key)} -- npx -y tsx ${esc(me.mcpScript)}</pre>

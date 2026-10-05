@@ -28,6 +28,8 @@ import { permissionsRoutes } from "./permissions-routes.js";
 import { agentControlsRoutes, controlsRoutes } from "./controls-routes.js";
 import { completeDelayedApprovals } from "./approvals.js";
 import { familyRoutes } from "./family-routes.js";
+import { addTestCredits, approveTestCall, testKeyAllowed } from "./testmode.js";
+import { purchasesRoutes } from "./purchases-routes.js";
 import { applyDueChanges, getProtection, helperOn, scheduleAgentLimits } from "./helpers.js";
 import { auditTx } from "./audit.js";
 import { withTx } from "./db.js";
@@ -84,6 +86,7 @@ const limitsSchema = z.object({
     .optional(),
   observeAboveCents: nullableCents,
 });
+const createKeySchema = limitsSchema.extend({ name: z.string().min(1).max(80), test: z.boolean().optional() });
 
 export function createApp(db: Db) {
   const app = express();
@@ -108,7 +111,7 @@ export function createApp(db: Db) {
   const helperAllowed = (method: string, path: string) =>
     (method === "GET" &&
       ["/api/me", "/api/controls/board", "/api/controls/audit", "/api/controls/audit/verify", "/api/controls/policy", "/api/controls/incidents",
-       "/api/controls/reviews", "/api/approvals", "/api/everyday", "/api/ledger"].includes(path)) ||
+       "/api/controls/reviews", "/api/approvals", "/api/everyday", "/api/ledger", "/api/purchases"].includes(path)) ||
     (method === "POST" && (path === "/api/controls/freeze" || /^\/api\/approvals\/[^/]+\/(start|approve|deny)$/.test(path)));
 
   const ownerOnly = (req: Request, _res: Response, next: NextFunction) => {
@@ -134,9 +137,12 @@ export function createApp(db: Db) {
   const signerId = (req: Request) => (req.signer ?? req.user)!.id;
   const agentOnly = (req: Request, _res: Response, next: NextFunction) => {
     const token = bearer(req);
-    (token?.startsWith("ap_agent_") ? agentKeyByToken(db, token) : Promise.resolve(null)).then((key) => {
+    (token?.startsWith("ap_agent_") || token?.startsWith("ap_test_") ? agentKeyByToken(db, token) : Promise.resolve(null)).then((key) => {
       if (!key) return next(new AppError(401, "unauthorized", "send a valid, unrevoked agent key as 'Authorization: Bearer ap_agent_...'"));
       req.agentKey = key;
+      if (key.test && !testKeyAllowed(req.method, req.originalUrl.split("?")[0].replace(/\/$/, ""))) {
+        return next(new AppError(403, "test_key_scope", "test keys (ap_test_...) can only list, quote and call paid tools; use a real agent key for the rest"));
+      }
       // The kill switch: while the owner has frozen everything, agents can do nothing at all.
       frozenAt(db, key.userId).then((frozen) => next(frozen ? frozenError() : undefined), next);
     }, next);
@@ -219,7 +225,7 @@ export function createApp(db: Db) {
     "/api/agent-keys",
     ownerOnly,
     h(async (req) => {
-      const body = parse(limitsSchema.extend({ name: z.string().min(1).max(80) }), req.body);
+      const body = parse(createKeySchema, req.body);
       const { name, ...limits } = body;
       // On a protected account, new agents start at L0: they ask before every paid call.
       const protectedAccount = !!(await getProtection(db, req.user!.id)).protectedAt;
@@ -259,8 +265,11 @@ export function createApp(db: Db) {
     "/api/approvals/:id/approve",
     ownerOnly,
     h(async (req) => {
-      const { passkey } = parse(z.object({ passkey: z.any().optional() }), req.body);
-      return approve(db, signerId(req), String(req.params.id), passkey);
+      const { passkey, scamCheck } = parse(
+        z.object({ passkey: z.any().optional(), scamCheck: z.object({ calledYou: z.boolean(), keepSecret: z.boolean(), urgent: z.boolean() }).optional() }),
+        req.body,
+      );
+      return approve(db, signerId(req), String(req.params.id), passkey, { scamCheck });
     }),
   );
   app.post(
@@ -513,8 +522,16 @@ export function createApp(db: Db) {
   app.use("/api/agent/grocery", agentOnly, groceryRoutes(db, "agent"));
   app.use("/api/permissions", ownerOnly, permissionsRoutes(db, "owner"));
   app.use("/api/agent/controls", agentOnly, agentControlsRoutes(db));
+  app.post(
+    "/api/agent/test/credit",
+    agentOnly,
+    h(async (req) => addTestCredits(db, req.agentKey!, parse(z.object({ amountCents: cents }), req.body).amountCents)),
+  );
+  app.post("/api/agent/test/approvals/:id/approve", agentOnly, h(async (req) => approveTestCall(db, req.agentKey!, String(req.params.id))));
   app.use("/api/controls", ownerOnly, controlsRoutes(db));
   app.use("/api/family", ownerOnly, familyRoutes(db));
+  app.use("/api/purchases", ownerOnly, purchasesRoutes(db, "owner"));
+  app.use("/api/agent/purchases", agentOnly, purchasesRoutes(db, "agent"));
   app.use("/api/agent/permissions", agentOnly, permissionsRoutes(db, "agent"));
 
   // ------------------------------------------------------------ demo provider + dashboard

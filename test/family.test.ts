@@ -37,7 +37,7 @@ afterAll(async () => {
   await db.end();
 });
 
-const ok = { requirePasskey: false };
+const ok = { requirePasskey: false, scamCheck: { calledYou: false, keepSecret: false, urgent: false } };
 let n = 0;
 
 /** An owner with credit and an agent, plus a helper who accepted an invitation. */

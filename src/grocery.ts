@@ -6,6 +6,7 @@ import type { Db, Tx } from "./db.js";
 import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
 import { enforce, refusalMessage, screen } from "./policy.js";
+import { recordPurchase } from "./purchases.js";
 import { rememberPurchases } from "./shopping.js";
 
 // Grocery lists: typed, or read from a photo with Claude. The owner's agent
@@ -390,7 +391,7 @@ export async function reopenList(db: Db, userId: string, listId: string) {
 export async function markOrdered(db: Db, userId: string, listId: string, input: { orderNumber?: string; totalCents: number }, byAgent: boolean) {
   if (!Number.isSafeInteger(input.totalCents) || input.totalCents <= 0) throw new AppError(400, "invalid_total", "totalCents must be a positive integer");
   return withTx(db, async (tx) => {
-    const { rows } = await tx.query("SELECT status, approved_max_cents AS max FROM grocery_lists WHERE id = $1 AND user_id = $2 FOR UPDATE", [listId, userId]);
+    const { rows } = await tx.query("SELECT status, store, title, approved_max_cents AS max FROM grocery_lists WHERE id = $1 AND user_id = $2 FOR UPDATE", [listId, userId]);
     const list = rows[0];
     if (!list) throw new AppError(404, "not_found", "grocery list not found");
     if (list.status === "ordered") throw new AppError(409, "already_ordered", "already recorded as ordered");
@@ -402,6 +403,8 @@ export async function markOrdered(db: Db, userId: string, listId: string, input:
       listId, input.orderNumber?.slice(0, 80) ?? null, input.totalCents,
     ]);
     await rememberPurchases(tx, userId, listId);
+    // Track it until the owner confirms everything arrived, and remind before the return window closes.
+    await recordPurchase(tx, userId, { source: "grocery", sourceId: listId, store: list.store ?? "store", title: list.title, orderNumber: input.orderNumber, totalCents: input.totalCents });
     return getList(tx, userId, listId);
   });
 }

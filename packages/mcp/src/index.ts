@@ -65,7 +65,9 @@ const server = new McpServer(
       "On a protected account, big or sensitive approvals also need a trusted helper's signature or a waiting period after the owner approves: " +
       "if check_approval says so, wait and don't ask the owner to approve again. Never pressure the owner to hurry an approval or to remove a helper. " +
       "Never buy a watched item unless check_buy_mandate says allowed for that price and site, right before checkout; then record the price with mark_bought. " +
-      "If you made a mistake that cost money, say so and record it with report_mistake.",
+      "If you made a mistake that cost money, say so and record it with report_mistake. " +
+      "After placing an order, it's tracked as a purchase with a return deadline (list_purchases); ask the owner whether everything arrived and record it with confirm_received. " +
+      "If your key starts with ap_test_, it's a test key: payments are pretend, providers aren't paid, and you can approve your own call approvals with approve_test_call.",
   },
 );
 
@@ -753,6 +755,73 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: false },
   },
   ({ description, kind, amount_cents, call_id }) => reply(api("POST", ctl("/incidents"), { description, kind, amountCents: amount_cents, holdId: call_id })),
+);
+
+// ---------------------------------------------------------------- purchases
+
+server.registerTool(
+  "list_purchases",
+  {
+    title: "Orders and return deadlines",
+    description: "Open purchases (groceries, items bought under a buy mandate, anything you recorded) with their return deadline, and reminders: return windows closing soon and orders not yet confirmed as received.",
+    annotations: { readOnlyHint: true },
+  },
+  () => reply(api("GET", "/api/agent/purchases")),
+);
+
+server.registerTool(
+  "record_purchase",
+  {
+    title: "Record an order you placed",
+    description: "Record an order so its return deadline is tracked. Groceries and buy-mandate purchases are recorded automatically; use this for anything else you ordered for the owner.",
+    inputSchema: {
+      store: z.string().max(80).describe("e.g. target.com"),
+      title: z.string().max(200),
+      order_number: z.string().max(80).optional(),
+      total_cents: z.number().int().nonnegative().optional(),
+      return_days: z.number().int().min(0).max(365).optional().describe("From the store's return policy, if you know it"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ store, title, order_number, total_cents, return_days }) =>
+    reply(api("POST", "/api/agent/purchases", { store, title, orderNumber: order_number, totalCents: total_cents, returnDays: return_days })),
+);
+
+server.registerTool(
+  "confirm_received",
+  {
+    title: "Record what arrived",
+    description:
+      "After the owner tells you whether an order arrived complete, record it. List missing or wrong items; the result says what refund to ask the store for. " +
+      "Draft that request, but send it only with the owner's go-ahead.",
+    inputSchema: { purchase_id: z.string(), missing_items: z.array(z.string().max(120)).optional(), note: z.string().max(500).optional() },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ purchase_id, missing_items, note }) => reply(api("POST", `/api/agent/purchases/${encodeURIComponent(purchase_id)}/received`, { missingItems: missing_items, note })),
+);
+
+// ---------------------------------------------------------------- test keys
+
+server.registerTool(
+  "approve_test_call",
+  {
+    title: "Approve a call (test keys only)",
+    description: "With a test key (ap_test_...), approve your own pending call approval so automated tests can run without the owner's passkey. Real keys can't use this.",
+    inputSchema: { approval_id: z.string() },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ approval_id }) => reply(api("POST", `/api/agent/test/approvals/${encodeURIComponent(approval_id)}/approve`, {})),
+);
+
+server.registerTool(
+  "add_test_credits",
+  {
+    title: "Add pretend credits (test keys only)",
+    description: "With a test key, top up the pretend test wallet (up to 100000 cents at a time).",
+    inputSchema: { amount_cents: z.number().int().positive().max(100_000) },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ amount_cents }) => reply(api("POST", "/api/agent/test/credit", { amountCents: amount_cents })),
 );
 
 await server.connect(new StdioServerTransport());

@@ -88,7 +88,7 @@ Ranked by usefulness against effort. All of these sit on code that exists.
 | 9 | Provider revenue dashboard and free-call grants | Developers | S | Ledger, marketplace |
 | 10 | Care mode | Older adults | S/M | Dashboard |
 
-Items 1, 2 and 3 make a good next release: one for each audience, all small.
+Items 1, 2 and 3 make a good next release: one for each audience, all small. **Built (2026-10-05):** the phone-scam check, test keys, and purchases with return windows and confirm-received.
 
 ## Cautions
 

@@ -222,8 +222,29 @@ For people who want someone they trust watching over their agents' spending: an 
 - **Weakening protection waits too.** Turning it off, raising the threshold, shortening the wait, removing a helper, or loosening an agent's limits only takes effect after the waiting period, and helpers see it in their alerts. The owner can cancel it in the meantime. Tightening is immediate, and so is revoking an agent key.
 - **New agents start at L0** (ask before every paid call) on a protected account.
 - **Alerts.** Each helper sees what's new on the accounts they help: approvals asked for, refusals, freezes, co-signatures, incidents, protection changes. **They appear on the dashboard only; nothing sends an email or a text yet.**
+- **"Is someone on the phone with you?"** Before signing a big or sensitive approval on a protected account, the owner answers three plain questions:
+  - Did someone phone or message you about this?
+  - Were you told to keep it secret?
+  - Were you told it's urgent?
+
+  Any "yes" holds the approval until a trusted helper reviews it (the waiting period no longer completes it) and alerts the helpers. Without helpers, the waiting period still applies, with a warning.
 - **An allowance instead.** If the caregiver should hold the money, the caregiver is the owner: give the other person's agent its own key with a monthly cap at L0 or L1. AgentPay never moves money between people.
 - **Agents are told.** If an approval waits for a co-signature, `check_approval` says so, and agents must wait rather than ask again. They must never pressure the owner to hurry or to remove a helper.
+
+## Orders and returns
+
+Every order the agent places becomes a **purchase** with a return deadline: grocery orders, and items bought under a buy mandate. Agents record other orders with `record_purchase`.
+- **Return deadlines** follow typical store policies (Walmart and Target 90 days, Amazon 30, Best Buy 15, others 30). The owner can correct the date.
+- **Reminders** come three days before the window closes, and for orders not confirmed two days after ordering.
+- **Confirming delivery.** The order stays open until the owner confirms what arrived (`confirm_received`). Missing items mark it as a problem and say what refund to ask the store for. The agent may draft the request, but sends it only with the owner's go-ahead.
+
+## Test keys for developers
+
+Create an agent key with **Test key** ticked (or `"test": true`), and it starts with `ap_test_`. A test key:
+- spends **pretend credits** from a separate test wallet, starting at $100 (`add_test_credits` adds more)
+- sends providers an `X-AgentPay-Test: true` header; they're never paid pretend money, and neither is the platform fee
+- follows its level and rules like a real key, and can **approve its own call approvals** (`approve_test_call`), so automated tests run end to end without a passkey
+- reaches only the paid-call endpoints, because subscriptions, envelopes, shopping and the owner's real subscriptions all involve real money
 
 ## What agents refuse
 
@@ -274,6 +295,8 @@ The owner can't turn this off; they buy these themselves.
 | `check_browser_access` / `request_browser_access` / `log_browser_activity` | Act in the owner's signed-in browser only with permission |
 | `pick_product` / `get_shopping_preferences` | Choose among versions of an item |
 | `check_purchase_policy` | Is this item, tool or site something agents must refuse? |
+| `list_purchases` / `record_purchase` / `confirm_received` | Orders, return deadlines and what arrived |
+| `approve_test_call` / `add_test_credits` | Test keys only: approve your own calls, add pretend credits |
 | `request_envelope` | Ask the owner to set money aside for this agent |
 | `report_mistake` | Record an incident the agent caused |
 

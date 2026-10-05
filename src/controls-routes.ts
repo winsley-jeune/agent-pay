@@ -24,6 +24,7 @@ import { h, parse } from "./http.js";
 import { guaranteePolicy, INCIDENT_KINDS, listIncidents, reportIncident, updateIncident } from "./incidents.js";
 import { listMandates } from "./mandates.js";
 import { listGrants, normalizeSite } from "./permissions.js";
+import { listPurchases, purchaseReminders } from "./purchases.js";
 import { policySummary, refusalMessage, screen, screenSite } from "./policy.js";
 
 const cents = z.number().int().positive().max(10_000_000);
@@ -116,7 +117,7 @@ export function controlsRoutes(db: Db) {
     "/board",
     h(async (req) => {
       const userId = uid(req);
-      const [keys, envelopes, vault, grants, mandates, subs, pending, reviews, incidents, frozen] = await Promise.all([
+      const [keys, envelopes, vault, grants, mandates, subs, pending, reviews, incidents, frozen, purchases, purchaseAlerts] = await Promise.all([
         listAgentKeys(db, userId),
         listEnvelopes(db, userId),
         vaultSummary(db, userId),
@@ -127,6 +128,8 @@ export function controlsRoutes(db: Db) {
         toReview(db, userId),
         listIncidents(db, userId),
         frozenAt(db, userId),
+        listPurchases(db, userId, { open: true }),
+        purchaseReminders(db, userId),
       ]);
       return {
         frozenAt: frozen,
@@ -152,6 +155,8 @@ export function controlsRoutes(db: Db) {
         pendingApprovals: pending.length,
         toReview: reviews,
         openIncidents: incidents,
+        openPurchases: purchases,
+        purchaseReminders: purchaseAlerts,
       };
     }),
   );

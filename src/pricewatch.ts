@@ -6,6 +6,7 @@ import { reportIncidentTx } from "./incidents.js";
 import { useMandate } from "./mandates.js";
 import { normalizeSite } from "./permissions.js";
 import { enforce, enforceSite } from "./policy.js";
+import { recordPurchase } from "./purchases.js";
 
 // Watch an item until it drops to a target price. Prices come from the
 // owner's agent (which reads the page in the owner's own browser), from the
@@ -247,6 +248,7 @@ export async function markBought(db: Db, userId: string, id: string, priceCents?
   const mandate = await withTx(db, async (tx) => {
     await tx.query("UPDATE price_watches SET status = 'bought', bought_at = now(), bought_price_cents = $3 WHERE id = $1 AND user_id = $2", [id, userId, paid]);
     const used = await useMandate(tx, userId, id, paid, agentKey?.id ?? null);
+    await recordPurchase(tx, userId, { source: "price_watch", sourceId: id, store: w.retailer, title: w.title, totalCents: paid }, agentKey);
     if (used && !used.within && agentKey) {
       await reportIncidentTx(
         tx, userId,

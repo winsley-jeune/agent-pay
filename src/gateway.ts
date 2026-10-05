@@ -38,6 +38,7 @@ export type CallResult =
 
 interface HoldRow {
   id: string;
+  test: boolean;
   agentKeyId: string;
   walletAccountId: string;
   toolId: string;
@@ -48,7 +49,7 @@ interface HoldRow {
   error: string | null;
 }
 
-const holdColumns = `id, agent_key_id AS "agentKeyId", wallet_account_id AS "walletAccountId", tool_id AS "toolId",
+const holdColumns = `id, test, agent_key_id AS "agentKeyId", wallet_account_id AS "walletAccountId", tool_id AS "toolId",
   amount_cents AS "amountCents", captured_cents AS "capturedCents", status, result, error`;
 
 export interface GatewayOptions {
@@ -85,6 +86,7 @@ export async function spendSummary(q: Db | Tx, agentKey: AgentKey) {
   const envelopes = (await listEnvelopes(q, agentKey.userId)).filter((e) => e.status === "active" && (!e.agentKeyId || e.agentKeyId === agentKey.id));
   return {
     frozen: (await frozenAt(q, agentKey.userId)) !== null,
+    test: agentKey.test,
     level: agentKey.level,
     levelLabel: LEVEL_LABELS[agentKey.level],
     spendRules: agentKey.spendRules,
@@ -195,11 +197,11 @@ async function placeHold(
 
     const { rows } = await tx.query(
       `INSERT INTO holds (agent_key_id, wallet_account_id, tool_id, idempotency_key, amount_cents, expires_at, subscription_id,
-                          decision, decision_reason, agent_reason)
-       VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9, $10)
+                          decision, decision_reason, agent_reason, test)
+       VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9, $10, $11)
        RETURNING ${holdColumns}`,
       [agentKey.id, funding, tool.id, req.idempotencyKey, amountCents, config.holdTtlSeconds, subscriptionId,
-       decision.kind, decision.reason.slice(0, 300), req.reason?.slice(0, 500) ?? null],
+       decision.kind, decision.reason.slice(0, 300), req.reason?.slice(0, 500) ?? null, agentKey.test],
     );
     const hold: HoldRow = rows[0];
     if (amountCents > 0) {
@@ -241,14 +243,16 @@ export async function captureHold(
     const fee = Math.floor((charged * feeBps) / 10_000);
     const tool = (await toolById(tx, hold.toolId))!;
     const { rows } = await tx.query("SELECT account_id FROM providers WHERE id = $1", [tool.providerId]);
+    // Pretend money from a test key never reaches a provider's earnings or the platform's fees.
+    const testSink = hold.test ? await systemAccount(tx, "test_sink") : null;
     if (hold.amountCents > 0) {
       await post(
         tx,
         "capture",
         [
           { accountId: await systemAccount(tx, "holds"), amountCents: -hold.amountCents },
-          { accountId: rows[0].account_id, amountCents: charged - fee },
-          { accountId: await systemAccount(tx, "platform_fees"), amountCents: fee },
+          { accountId: testSink ?? rows[0].account_id, amountCents: charged - fee },
+          { accountId: testSink ?? (await systemAccount(tx, "platform_fees")), amountCents: fee },
           { accountId: hold.walletAccountId, amountCents: hold.amountCents - charged },
         ],
         `capture ${hold.id}: ${charged}c of ${hold.amountCents}c held`,
@@ -293,11 +297,13 @@ export async function sweepExpiredHolds(db: Db): Promise<number> {
   return released;
 }
 
-async function callUpstream(tool: Tool, callId: string, input: unknown, fetchImpl: typeof fetch) {
+async function callUpstream(tool: Tool, callId: string, input: unknown, fetchImpl: typeof fetch, test = false) {
   const headers: Record<string, string> = {
     "content-type": "application/json",
     "x-agentpay-call-id": callId,
     "x-agentpay-tool": tool.slug,
+    // Providers can return sample data for test calls; they aren't paid for them.
+    ...(test ? { "x-agentpay-test": "true" } : {}),
   };
   if (tool.upstreamAuth) headers.authorization = tool.upstreamAuth;
   const res = await fetchImpl(tool.upstreamUrl, {
@@ -345,7 +351,12 @@ export async function callPaidTool(db: Db, agentKey: AgentKey, req: CallRequest,
 const usd = (c: number) => `$${(c / 100).toFixed(2)}`;
 
 async function logCall(agentKey: AgentKey, req: CallRequest, kind: string, summary: string, result: string | null, data: Record<string, unknown>, db: Db) {
+  // (summary and data are reassigned below for test keys)
   const reason = req.reason ?? null;
+  if (agentKey.test) {
+    summary = `[test] ${summary}`;
+    data = { ...data, test: true };
+  }
   if (kind === "call_paid" && data.callId) {
     const { rows } = await db.query(`SELECT decision, decision_reason AS "decisionReason" FROM holds WHERE id = $1`, [data.callId]);
     if (rows[0]) data = { ...data, decision: rows[0].decision, decidedBecause: rows[0].decisionReason };
@@ -368,7 +379,8 @@ async function runPaidCall(db: Db, agentKey: AgentKey, req: CallRequest, opts: G
   if (existing) return replay(db, existing, tool.id);
 
   // A subscription with included calls left makes this call free; budgets and approvals don't apply.
-  const coverage = await findCoverage(db, agentKey.userId, tool);
+  // Test keys never use the owner's real subscriptions.
+  const coverage = agentKey.test ? null : await findCoverage(db, agentKey.userId, tool);
   const amountCents = coverage ? 0 : quote(tool, req.input).amountCents;
 
   if (!coverage && agentKey.perCallMaxCents !== null && amountCents > agentKey.perCallMaxCents) {
@@ -415,7 +427,7 @@ async function runPaidCall(db: Db, agentKey: AgentKey, req: CallRequest, opts: G
 
   let upstream: Awaited<ReturnType<typeof callUpstream>>;
   try {
-    upstream = await callUpstream(tool, hold.id, req.input, opts.fetchImpl ?? fetch);
+    upstream = await callUpstream(tool, hold.id, req.input, opts.fetchImpl ?? fetch, agentKey.test);
   } catch (err: any) {
     const message = err?.name === "TimeoutError" ? "provider timed out" : String(err?.message ?? err);
     await releaseHold(db, hold.id, message);
