@@ -96,6 +96,7 @@ describe("HTTP API", () => {
     const r = await call("POST", "/api/agent/call", k.key, { tool: "x" });
     expect(r).toMatchObject({ status: 400, body: { error: { code: "invalid_request" } } });
     expect(r.body.error.message).toContain("idempotencyKey");
+    expect((await call("POST", "/api/approvals/not-a-uuid/approve", owner, {})).status).toBe(404);
   });
 
   it("stops a revoked key immediately", async () => {

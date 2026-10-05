@@ -469,6 +469,11 @@ export function createApp(db: Db) {
       res.status(err.status).json({ error: { code: err.code, message: err.message, details: err.details } });
       return;
     }
+    // Postgres rejects malformed UUIDs in path params (e.g. /api/approvals/abc).
+    if ((err as { code?: string })?.code === "22P02") {
+      res.status(404).json({ error: { code: "not_found", message: "no record with that id" } });
+      return;
+    }
     if ((err as { type?: string })?.type === "entity.parse.failed") {
       res.status(400).json({ error: { code: "invalid_json", message: "request body is not valid JSON" } });
       return;
