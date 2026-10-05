@@ -110,6 +110,22 @@ Changing the cart after asking for approval cancels that request. AgentPay has n
 
 Try it with `examples/grocery-list.png`.
 
+## Permissions: agents in your own browser
+
+- **The risk statement.** Before an agent may act on any website, the owner reads it on the Permissions page and signs it with their passkey. It says plainly:
+  - what's protected: passkey approvals, prepaid limits, merchant-locked cards, instant revoke
+  - what isn't: mistakes the agent makes inside a site you allowed, and a charge to a personal card the store also has saved
+- **Per-site permission.** The owner then allows each site separately (`walmart.com`, subdomains included) for specific actions: browse, fill the cart, check out approved orders, manage subscriptions. Each permission has an expiry, can be revoked any time, and withdrawing the statement revokes them all. Every agent action is logged, including attempts that weren't allowed.
+- **Signed-in sessions only.** Agents use sessions the owner is already signed in to. They never type passwords or sign-in codes, never see payment details (not even the last four digits), and never change the payment method. AgentPay stores none of these.
+- **A rule, not a lock.** AgentPay can't see or block what happens in the browser; a permission is a recorded consent the agent must check (`check_browser_access`) before acting. The hard limits come from approvals and, later, prepaid cards ([design](docs/design/virtual-cards.md)).
+
+**Choosing products.** When a store shows many versions of an item, the agent sends what it sees to `pick_product`. For "2 lb carrots", the options might be 1 lb, 2 lb or 5 lb bags, baby carrots, organic carrots, or carrot cake. AgentPay picks using:
+- the quantity on the list and the price per unit
+- the owner's preferences: organic, store brand, size strategy, brands, dietary needs, minimum rating
+- what the owner bought before at that store, remembered after each order
+
+It never picks a different product, so carrot cake is out, and it reports what it skipped and why.
+
 ## MCP tools
 
 | Tool | What it does |
@@ -130,6 +146,8 @@ Try it with `examples/grocery-list.png`.
 | `watch_price` / `list_price_watches` / `record_price` / `mark_bought` / `stop_watch` | Wait for a sale |
 | `create_grocery_list` (items, text or photo) / `get_grocery_list` / `list_grocery_lists` / `set_grocery_store` | Grocery lists |
 | `update_grocery_item` / `request_order_approval` / `mark_grocery_ordered` | Fill the cart, get approval, record the order |
+| `check_browser_access` / `request_browser_access` / `log_browser_activity` | Act in the owner's signed-in browser only with permission |
+| `pick_product` / `get_shopping_preferences` | Choose among versions of an item |
 
 ## Configuration
 
