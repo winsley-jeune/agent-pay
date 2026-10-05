@@ -19,7 +19,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "seed:maria": "tsx src/seed-maria.ts",
-    "build:mcp": "npm run build -w packages/mcp"
+    "build:mcp": "npm run build -w packages/mcp",
+    "build:verify": "npm run build -w packages/verify"
   },
   "keywords": [
     "mcp",

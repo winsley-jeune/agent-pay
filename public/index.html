@@ -1145,11 +1145,14 @@ async function provider() {
     </table></div>
       <div class="grid" id="newtool" style="margin-top:10px">
         <label>Slug<input name="slug" placeholder="my-api"></label><label>Name<input name="name"></label>
-        <label>Price per call ($)<input name="price" type="number" step="0.01" min="0" value="0.05"></label>
+        <label>Pricing<select name="pricing"><option value="per_call">Fixed price per call</option><option value="quoted">Quoted per task (price below is the maximum)</option></select></label>
+        <label>Price per call, or maximum ($)<input name="price" type="number" step="0.01" min="0" value="0.05"></label>
+        <label>Answers<select name="mode"><option value="sync">Right away (within 30 s)</option><option value="async">Later, as a job (callback)</option></select></label>
         <label>Endpoint URL<input name="url" placeholder="https://api.example.com/agentpay"></label>
         <label>Authorization header<input name="auth" placeholder="Bearer secret"></label>
         <label>Description<input name="desc"></label>
       </div><div class="row" style="margin-top:8px"><button id="addtool">Add tool</button></div>
+      <p class="small muted">Every request AgentPay sends you is signed: check it with <code>@winsley-jeune/agentpay-verify</code>. Agents selling their work can quote a price per task and run as jobs. See docs/providers.md.</p>
     </div>
     <div class="card"><h3>Plans</h3><div class="table-wrap"><table><tr><th>Plan</th><th>Category</th><th class="num">Price</th><th>Includes</th><th></th></tr>
       ${d.plans.map((p) => `<tr><td><b>${esc(p.name)}</b> <span class="small muted">${esc(p.slug)}</span></td><td>${esc(p.category)}</td>
@@ -1168,7 +1171,7 @@ async function provider() {
   $("#payout").onclick = act(async () => { await api("POST", `/api/providers/${pid}/payouts`, { amountCents: d.earningsCents }); toast("Payout requested."); provider(); });
   $("#addtool").onclick = act(async () => {
     const f = (n) => $(`#newtool [name=${n}]`).value.trim();
-    await api("POST", `/api/providers/${pid}/tools`, { slug: f("slug"), name: f("name"), description: f("desc") || f("name"), pricingType: "per_call", priceCents: toCents(f("price")), upstreamUrl: f("url"), upstreamAuth: f("auth") || undefined });
+    await api("POST", `/api/providers/${pid}/tools`, { slug: f("slug"), name: f("name"), description: f("desc") || f("name"), pricingType: f("pricing"), mode: f("mode"), priceCents: toCents(f("price")), upstreamUrl: f("url"), upstreamAuth: f("auth") || undefined });
     toast("Tool listed."); provider();
   });
   $("#addplan").onclick = act(async () => {

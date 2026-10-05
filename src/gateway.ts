@@ -10,6 +10,9 @@ import { decideCall, frozenAt, frozenError, LEVEL_LABELS, listEnvelopes, lockEnv
 import { quote, toolById, toolBySlug, type Tool } from "./registry.js";
 import { findCoverage } from "./subscriptions.js";
 import { enforce } from "./policy.js";
+import { createHash, randomBytes } from "node:crypto";
+import { DEFAULT_MAX_JOB_SECONDS } from "./registry.js";
+import { signatureHeaders } from "./signing.js";
 
 export interface CallRequest {
   tool: string;
@@ -17,6 +20,8 @@ export interface CallRequest {
   /** Same key + same agent = same call. Retrying never charges twice. */
   idempotencyKey: string;
   approvalId?: string;
+  /** For tools priced per task: the quote from request_task_quote. */
+  quoteId?: string;
   /** Why the agent is making this call, and what the owner asked for. Kept in the owner's log. */
   reason?: string;
   instruction?: string;
@@ -34,11 +39,14 @@ export type CallResult =
       coveredBySubscription?: string;
     }
   | { status: "failed"; callId: string; chargedCents: 0; balanceCents: number; error: string; replayed: boolean }
+  /** An async job is running: the money is held until the provider reports back or the job times out. */
+  | { status: "running"; callId: string; heldCents: number; balanceCents: number; message: string; replayed: boolean }
   | { status: "pending_approval"; approvalId: string; amountCents: number; approveUrl: string; message: string; why: string };
 
 interface HoldRow {
   id: string;
   test: boolean;
+  async: boolean;
   agentKeyId: string;
   walletAccountId: string;
   toolId: string;
@@ -49,7 +57,7 @@ interface HoldRow {
   error: string | null;
 }
 
-const holdColumns = `id, test, agent_key_id AS "agentKeyId", wallet_account_id AS "walletAccountId", tool_id AS "toolId",
+const holdColumns = `id, test, async, agent_key_id AS "agentKeyId", wallet_account_id AS "walletAccountId", tool_id AS "toolId",
   amount_cents AS "amountCents", captured_cents AS "capturedCents", status, result, error`;
 
 export interface GatewayOptions {
@@ -118,15 +126,32 @@ async function replay(db: Db, hold: HoldRow, toolId: string): Promise<CallResult
   if (hold.toolId !== toolId) {
     throw new AppError(422, "idempotency_conflict", "this idempotency key was already used for a different tool");
   }
+  const balanceCents = await balance(db, hold.walletAccountId);
+  if (hold.status === "held" && hold.async) return runningResult(hold, balanceCents, true);
   if (hold.status === "held") {
     throw new AppError(409, "call_in_progress", "a call with this idempotency key is still running; retry shortly");
   }
-  const balanceCents = await balance(db, hold.walletAccountId);
   if (hold.status === "captured") {
     return { status: "ok", callId: hold.id, chargedCents: hold.capturedCents!, balanceCents, result: hold.result, replayed: true };
   }
   return { status: "failed", callId: hold.id, chargedCents: 0, balanceCents, error: hold.error ?? "call failed", replayed: true };
 }
+
+function runningResult(hold: Pick<HoldRow, "id" | "amountCents">, balanceCents: number, replayed: boolean): CallResult {
+  return {
+    status: "running", callId: hold.id, heldCents: hold.amountCents, balanceCents, replayed,
+    message: `The provider is working on it. ${hold.amountCents}c is held, not charged; it's charged only when the result arrives, and returned if the job fails or times out. Check with get_job using callId "${hold.id}".`,
+  };
+}
+
+/** Stable JSON (sorted keys), so the same input always hashes the same. */
+function stableJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(",")}]`;
+  if (v && typeof v === "object") return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stableJson((v as Record<string, unknown>)[k])}`).join(",")}}`;
+  return JSON.stringify(v);
+}
+const inputHash = (input: unknown) => createHash("sha256").update(stableJson(input ?? {})).digest("hex");
+const tokenHash = (token: string) => createHash("sha256").update(token).digest("hex");
 
 /**
  * Reserve funds for one call. Takes the wallet lock so that balance and
@@ -140,6 +165,7 @@ async function placeHold(
   req: CallRequest,
   subscriptionId: string | null,
   decision: { kind: "auto" | "observe" | "approved" | "covered"; reason: string; envelopeId: string | null },
+  job: { ttlSeconds: number; async: boolean; jobTokenHash: string | null; quoteId: string | null } = { ttlSeconds: config.holdTtlSeconds, async: false, jobTokenHash: null, quoteId: null },
 ): Promise<HoldRow> {
   return withTx(db, async (tx) => {
     // Always the owner's wallet first, then any envelope: per-agent caps count holds from both.
@@ -187,6 +213,15 @@ async function placeHold(
       }
     }
 
+    if (job.quoteId) {
+      // A quote pays for one call only.
+      const used = await tx.query(
+        "UPDATE task_quotes SET status = 'used' WHERE id = $1 AND agent_key_id = $2 AND tool_id = $3 AND status = 'open' AND expires_at > now()",
+        [job.quoteId, agentKey.id, tool.id],
+      );
+      if (!used.rowCount) throw new AppError(409, "quote_invalid", "this quote was already used or has expired; ask for a new one");
+    }
+
     const available = await balance(tx, funding);
     if (available < amountCents) {
       throw new AppError(402, "insufficient_funds", "not enough credits; ask the owner to top up", {
@@ -197,11 +232,11 @@ async function placeHold(
 
     const { rows } = await tx.query(
       `INSERT INTO holds (agent_key_id, wallet_account_id, tool_id, idempotency_key, amount_cents, expires_at, subscription_id,
-                          decision, decision_reason, agent_reason, test)
-       VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9, $10, $11)
+                          decision, decision_reason, agent_reason, test, async, job_token_hash, quote_id)
+       VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING ${holdColumns}`,
-      [agentKey.id, funding, tool.id, req.idempotencyKey, amountCents, config.holdTtlSeconds, subscriptionId,
-       decision.kind, decision.reason.slice(0, 300), req.reason?.slice(0, 500) ?? null, agentKey.test],
+      [agentKey.id, funding, tool.id, req.idempotencyKey, amountCents, job.ttlSeconds, subscriptionId,
+       decision.kind, decision.reason.slice(0, 300), req.reason?.slice(0, 500) ?? null, agentKey.test, job.async, job.jobTokenHash, job.quoteId],
     );
     const hold: HoldRow = rows[0];
     if (amountCents > 0) {
@@ -297,31 +332,47 @@ export async function sweepExpiredHolds(db: Db): Promise<number> {
   return released;
 }
 
-async function callUpstream(tool: Tool, callId: string, input: unknown, fetchImpl: typeof fetch, test = false) {
+interface UpstreamOptions {
+  db: Db;
+  agentKey: AgentKey;
+  heldCents: number;
+  phase?: "call" | "quote";
+  jobToken?: string | null;
+  quote?: { id: string; ref: string | null } | null;
+}
+
+/**
+ * Send one signed request to the provider. Calls carry `{ callId, input }`
+ * (plus `quote` for quoted tools and `callbackUrl` for async jobs); quote
+ * requests carry `{ phase: "quote", quoteRequestId, input }`.
+ */
+async function callUpstream(tool: Tool, callId: string, input: unknown, fetchImpl: typeof fetch, o: UpstreamOptions) {
+  const phase = o.phase ?? "call";
+  const callbackUrl = o.jobToken ? `${config.publicUrl}/api/jobs/${callId}` : undefined;
+  const body = JSON.stringify(
+    phase === "quote" ? { phase, quoteRequestId: callId, input } : { callId, input, ...(o.quote ? { quote: o.quote } : {}), ...(callbackUrl ? { callbackUrl } : {}) },
+  );
   const headers: Record<string, string> = {
     "content-type": "application/json",
     "x-agentpay-call-id": callId,
-    "x-agentpay-tool": tool.slug,
     // Providers can return sample data for test calls; they aren't paid for them.
-    ...(test ? { "x-agentpay-test": "true" } : {}),
+    ...(o.agentKey.test ? { "x-agentpay-test": "true" } : {}),
+    // Who is paying and how much is held, signed by AgentPay (docs/providers.md).
+    ...(await signatureHeaders(o.db, { phase, id: callId, tool: tool.slug, heldCents: o.heldCents, agentId: o.agentKey.id, body })),
+    ...(o.jobToken ? { "x-agentpay-job-token": o.jobToken, "x-agentpay-callback-url": callbackUrl! } : {}),
   };
   if (tool.upstreamAuth) headers.authorization = tool.upstreamAuth;
-  const res = await fetchImpl(tool.upstreamUrl, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ callId, input }),
-    signal: AbortSignal.timeout(config.upstreamTimeoutMs),
-  });
+  const res = await fetchImpl(tool.upstreamUrl, { method: "POST", headers, body, signal: AbortSignal.timeout(config.upstreamTimeoutMs) });
   const text = await res.text();
   if (!res.ok) throw new Error(`provider returned HTTP ${res.status}: ${text.slice(0, 500)}`);
-  let body: unknown = text;
+  let parsed: unknown = text;
   try {
-    body = JSON.parse(text);
+    parsed = JSON.parse(text);
   } catch {
     // plain-text result is fine
   }
   const unitsHeader = res.headers.get("x-agentpay-units");
-  return { body, unitsUsed: unitsHeader !== null && /^\d+$/.test(unitsHeader) ? Number(unitsHeader) : null };
+  return { status: res.status, body: parsed, unitsUsed: unitsHeader !== null && /^\d+$/.test(unitsHeader) ? Number(unitsHeader) : null };
 }
 
 /**
@@ -341,6 +392,8 @@ export async function callPaidTool(db: Db, agentKey: AgentKey, req: CallRequest,
   }
   if (result.status === "pending_approval") {
     await logCall(agentKey, req, "call_needs_approval", `Asked the owner to approve ${usd(result.amountCents)} for ${req.tool}`, result.why, { approvalId: result.approvalId }, db);
+  } else if (result.status === "running") {
+    if (!result.replayed) await logCall(agentKey, req, "job_started", `Started a job with ${req.tool}; ${usd(result.heldCents)} held until it finishes`, null, { callId: result.callId }, db);
   } else if (!result.replayed) {
     const summary = result.status === "ok" ? `Paid ${usd(result.chargedCents)} for ${req.tool}` : `Call to ${req.tool} failed; not charged`;
     await logCall(agentKey, req, result.status === "ok" ? "call_paid" : "call_failed", summary, result.status === "ok" ? null : result.error, { callId: result.callId }, db);
@@ -380,8 +433,24 @@ async function runPaidCall(db: Db, agentKey: AgentKey, req: CallRequest, opts: G
 
   // A subscription with included calls left makes this call free; budgets and approvals don't apply.
   // Test keys never use the owner's real subscriptions.
-  const coverage = agentKey.test ? null : await findCoverage(db, agentKey.userId, tool);
-  const amountCents = coverage ? 0 : quote(tool, req.input).amountCents;
+  const coverage = agentKey.test || tool.pricingType === "quoted" ? null : await findCoverage(db, agentKey.userId, tool);
+  let quoted: { id: string; ref: string | null } | null = null;
+  let amountCents: number;
+  if (tool.pricingType === "quoted") {
+    if (!req.quoteId) quote(tool, req.input); // throws quote_required
+    const { rows } = await db.query(
+      `SELECT id, price_cents AS "priceCents", provider_ref AS ref, input_hash AS "inputHash", status, expires_at AS "expiresAt"
+         FROM task_quotes WHERE id = $1 AND agent_key_id = $2 AND tool_id = $3`,
+      [req.quoteId, agentKey.id, tool.id],
+    );
+    const q = rows[0];
+    if (!q || q.status !== "open" || new Date(q.expiresAt) <= new Date()) throw new AppError(409, "quote_invalid", "this quote was already used or has expired; ask for a new one");
+    if (q.inputHash !== inputHash(req.input)) throw new AppError(409, "quote_mismatch", "the quote was for a different input; ask for a new quote");
+    quoted = { id: q.id, ref: q.ref };
+    amountCents = q.priceCents;
+  } else {
+    amountCents = coverage ? 0 : quote(tool, req.input).amountCents;
+  }
 
   if (!coverage && agentKey.perCallMaxCents !== null && amountCents > agentKey.perCallMaxCents) {
     throw new AppError(402, "per_call_max_exceeded", "this call costs more than the agent's per-call limit", {
@@ -413,9 +482,16 @@ async function runPaidCall(db: Db, agentKey: AgentKey, req: CallRequest, opts: G
     decision = { kind: d.outcome, reason: d.reason, envelopeId: d.envelopeId };
   }
 
+  const jobToken = tool.mode === "async" ? `ap_job_${randomBytes(24).toString("base64url")}` : null;
+  const job = {
+    ttlSeconds: tool.mode === "async" ? (tool.maxJobSeconds ?? DEFAULT_MAX_JOB_SECONDS) : config.holdTtlSeconds,
+    async: tool.mode === "async",
+    jobTokenHash: jobToken ? tokenHash(jobToken) : null,
+    quoteId: quoted?.id ?? null,
+  };
   let hold: HoldRow;
   try {
-    hold = await placeHold(db, agentKey, tool, amountCents, { ...req, approvalId: coverage ? undefined : req.approvalId }, coverage?.subscriptionId ?? null, decision);
+    hold = await placeHold(db, agentKey, tool, amountCents, { ...req, approvalId: coverage ? undefined : req.approvalId }, coverage?.subscriptionId ?? null, decision, job);
   } catch (err: any) {
     // Lost a race with a concurrent call using the same idempotency key.
     if (err?.code === "23505") {
@@ -427,7 +503,7 @@ async function runPaidCall(db: Db, agentKey: AgentKey, req: CallRequest, opts: G
 
   let upstream: Awaited<ReturnType<typeof callUpstream>>;
   try {
-    upstream = await callUpstream(tool, hold.id, req.input, opts.fetchImpl ?? fetch, agentKey.test);
+    upstream = await callUpstream(tool, hold.id, req.input, opts.fetchImpl ?? fetch, { db, agentKey, heldCents: amountCents, jobToken, quote: quoted });
   } catch (err: any) {
     const message = err?.name === "TimeoutError" ? "provider timed out" : String(err?.message ?? err);
     await releaseHold(db, hold.id, message);
@@ -440,6 +516,9 @@ async function runPaidCall(db: Db, agentKey: AgentKey, req: CallRequest, opts: G
       replayed: false,
     };
   }
+
+  // An async job the provider accepted: keep the money held until it reports back.
+  if (tool.mode === "async" && upstream.status === 202) return runningResult(hold, await balance(db, agentKey.walletAccountId), false);
 
   const charge =
     tool.pricingType === "per_unit" && upstream.unitsUsed !== null
@@ -471,5 +550,110 @@ async function runPaidCall(db: Db, agentKey: AgentKey, req: CallRequest, opts: G
     result: upstream.body,
     replayed: false,
     ...(coverage ? { coveredBySubscription: coverage.subscriptionId } : {}),
+  };
+}
+
+// ---------------------------------------------------------------- async jobs
+
+/** Where an agent's job stands. */
+export async function getJob(db: Db, agentKey: AgentKey, callId: string) {
+  const { rows } = await db.query(
+    `SELECT h.id, h.status, h.async, h.amount_cents AS "heldCents", h.captured_cents AS "chargedCents", h.result, h.error,
+            h.expires_at AS "expiresAt", h.created_at AS "startedAt", h.settled_at AS "finishedAt", t.slug AS tool
+       FROM holds h JOIN tools t ON t.id = h.tool_id WHERE h.id = $1 AND h.agent_key_id = $2`,
+    [callId, agentKey.id],
+  );
+  const h = rows[0];
+  if (!h) throw new AppError(404, "not_found", "no call with that id for this agent");
+  const status = h.status === "held" ? "running" : h.status === "captured" ? "done" : "failed";
+  return {
+    callId: h.id, tool: h.tool, status, startedAt: h.startedAt, finishedAt: h.finishedAt,
+    ...(status === "running" ? { heldCents: h.heldCents, timesOutAt: h.expiresAt } : {}),
+    ...(status === "done" ? { chargedCents: h.chargedCents, result: h.result } : {}),
+    ...(status === "failed" ? { chargedCents: 0, error: h.error } : {}),
+  };
+}
+
+async function jobForProvider(db: Db, callId: string, token: string) {
+  const { rows } = await db.query(
+    `SELECT h.id, h.amount_cents AS "amountCents", h.job_token_hash AS "tokenHash", h.status, h.agent_key_id AS "agentKeyId", k.user_id AS "userId",
+            t.slug, t.pricing_type AS "pricingType", t.price_cents AS "priceCents"
+       FROM holds h JOIN tools t ON t.id = h.tool_id JOIN agent_keys k ON k.id = h.agent_key_id
+      WHERE h.id = $1 AND h.async`,
+    [callId],
+  );
+  const h = rows[0];
+  // Same answer for "no such job" and "wrong token", so job ids can't be probed.
+  if (!h || !token || h.tokenHash !== tokenHash(token)) throw new AppError(404, "not_found", "no job with that id and token");
+  return h;
+}
+
+/**
+ * The provider reports an async job's result (authenticated by the job token
+ * sent with the call). Charges up to the held amount, fewer units if reported.
+ */
+export async function completeJob(db: Db, callId: string, token: string, input: { result: unknown; units?: number }) {
+  const h = await jobForProvider(db, callId, token);
+  if (h.status !== "held") throw new AppError(409, "job_closed", h.status === "captured" ? "this job is already complete" : "this job already failed or timed out; it can't be charged");
+  const charge = h.pricingType === "per_unit" && Number.isInteger(input.units) && input.units! >= 0 ? Math.min(h.amountCents, input.units! * h.priceCents) : h.amountCents;
+  const captured = await captureHold(db, callId, charge, input.result ?? null);
+  if (!captured) throw new AppError(409, "job_closed", "this job already finished or timed out");
+  await audit(db, h.userId, {
+    actor: "system", agentKeyId: h.agentKeyId, kind: "call_paid", summary: `Job with ${h.slug} finished; paid ${usd(charge)}`, data: { callId, async: true },
+  }).catch((err) => console.error("audit log write failed", err));
+  return { callId, status: "done" as const, chargedCents: charge };
+}
+
+/** The provider reports that an async job failed: the held money goes back. */
+export async function failJob(db: Db, callId: string, token: string, error: string) {
+  const h = await jobForProvider(db, callId, token);
+  if (h.status !== "held") throw new AppError(409, "job_closed", "this job already finished");
+  await releaseHold(db, callId, `provider reported failure: ${error}`.slice(0, 2000));
+  await audit(db, h.userId, {
+    actor: "system", agentKeyId: h.agentKeyId, kind: "call_failed", summary: `Job with ${h.slug} failed; not charged`, result: error.slice(0, 300), data: { callId, async: true },
+  }).catch((err) => console.error("audit log write failed", err));
+  return { callId, status: "failed" as const, chargedCents: 0 };
+}
+
+// ---------------------------------------------------------------- quotes
+
+const MAX_QUOTE_SECONDS = 3600;
+
+/**
+ * Ask a provider to price a task. The provider answers `{ priceCents,
+ * description?, expiresInSeconds?, ref? }`; the price can't exceed the tool's
+ * ceiling. Free, and nothing is held. The agent then calls with the quoteId,
+ * and the owner's level, rules and limits apply to the quoted price as usual.
+ */
+export async function requestTaskQuote(db: Db, agentKey: AgentKey, slug: string, input: Record<string, unknown>, opts: GatewayOptions = {}) {
+  if (await frozenAt(db, agentKey.userId)) throw frozenError();
+  const tool = await getToolForAgent(db, agentKey, slug);
+  enforce(tool.slug, tool.name, tool.description);
+  if (tool.pricingType !== "quoted") throw new AppError(400, "not_quoted", `"${tool.slug}" has a fixed price; use get_quote`);
+  const quoteRequestId = randomBytes(12).toString("hex");
+  let upstream: Awaited<ReturnType<typeof callUpstream>>;
+  try {
+    upstream = await callUpstream(tool, quoteRequestId, input, opts.fetchImpl ?? fetch, { db, agentKey, heldCents: 0, phase: "quote" });
+  } catch (err: any) {
+    throw new AppError(502, "quote_failed", `the provider couldn't quote: ${err?.name === "TimeoutError" ? "timed out" : String(err?.message ?? err)}`.slice(0, 500));
+  }
+  const b = (upstream.body ?? {}) as { priceCents?: unknown; description?: unknown; expiresInSeconds?: unknown; ref?: unknown };
+  if (!Number.isSafeInteger(b.priceCents) || (b.priceCents as number) < 0) throw new AppError(502, "quote_failed", "the provider's quote has no valid priceCents");
+  if ((b.priceCents as number) > tool.priceCents) {
+    throw new AppError(502, "quote_over_ceiling", `the provider quoted ${b.priceCents}c, above this tool's listed maximum of ${tool.priceCents}c`);
+  }
+  const seconds = Math.min(Math.max(Number.isInteger(b.expiresInSeconds) ? (b.expiresInSeconds as number) : 900, 60), MAX_QUOTE_SECONDS);
+  const { rows } = await db.query(
+    `INSERT INTO task_quotes (agent_key_id, tool_id, input_hash, price_cents, description, provider_ref, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7)) RETURNING id, expires_at AS "expiresAt"`,
+    [agentKey.id, tool.id, inputHash(input), b.priceCents, typeof b.description === "string" ? b.description.slice(0, 500) : null, typeof b.ref === "string" ? b.ref.slice(0, 200) : null, seconds],
+  );
+  const decision = await decideCall(db, agentKey, tool, b.priceCents as number);
+  return {
+    quoteId: rows[0].id as string, tool: tool.slug, priceCents: b.priceCents as number,
+    description: typeof b.description === "string" ? b.description.slice(0, 500) : null, expiresAt: rows[0].expiresAt as Date,
+    needsApproval: decision.outcome === "approve", why: decision.reason,
+    overPerCallMax: agentKey.perCallMaxCents !== null && (b.priceCents as number) > agentKey.perCallMaxCents,
+    next: `Call ${tool.slug} with the same input and quoteId "${rows[0].id}" before it expires.`,
   };
 }

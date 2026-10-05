@@ -2,6 +2,7 @@ import { syncCatalog } from "../src/catalog.js";
 import { createAgentKey, createUser, type AgentKeyLimits } from "../src/auth.js";
 import { createPool, type Db } from "../src/db.js";
 import { resetSystemAccountCache } from "../src/ledger.js";
+import { resetSigningKeyCache } from "../src/signing.js";
 import { migrate } from "../src/migrate.js";
 import { createProvider, createTool, type NewTool } from "../src/registry.js";
 import { devCredit } from "../src/wallet.js";
@@ -12,6 +13,7 @@ export async function freshDb(): Promise<Db> {
   const db = createPool(TEST_URL);
   await db.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public;");
   resetSystemAccountCache();
+  resetSigningKeyCache();
   await migrate(db);
   await syncCatalog(db);
   return db;

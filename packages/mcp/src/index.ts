@@ -67,6 +67,8 @@ const server = new McpServer(
       "Never buy a watched item unless check_buy_mandate says allowed for that price and site, right before checkout; then record the price with mark_bought. " +
       "If you made a mistake that cost money, say so and record it with report_mistake. " +
       "After placing an order, it's tracked as a purchase with a return deadline (list_purchases); ask the owner whether everything arrived and record it with confirm_received. " +
+      "Some paid tools are other agents. Tools priced per task need request_task_quote first; call them with the quoteId. " +
+      "Async tools return status running: the money is held, not charged, until the result arrives; check with get_job. " +
       "If your key starts with ap_test_, it's a test key: payments are pretend, providers aren't paid, and you can approve your own call approvals with approve_test_call.",
   },
 );
@@ -100,13 +102,14 @@ server.registerTool(
       input: z.record(z.string(), z.unknown()).default({}).describe("Input matching the tool's inputSchema"),
       idempotency_key: z.string().max(200).optional().describe("Stable key for this logical call; generated if omitted"),
       approval_id: z.string().optional().describe("From an earlier pending_approval result, once the owner has approved"),
+      quote_id: z.string().optional().describe("For tools priced per task: the quoteId from request_task_quote (same input)"),
       reason: z.string().max(500).optional().describe("Why this call is needed; kept in the owner's log and shown if approval is needed"),
       instruction: z.string().max(500).optional().describe("What the owner asked for that led to this call, in a sentence"),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  ({ tool, input, idempotency_key, approval_id, reason, instruction }) =>
-    reply(api("POST", "/api/agent/call", { tool, input, idempotencyKey: idempotency_key ?? randomUUID(), approvalId: approval_id, reason, instruction })),
+  ({ tool, input, idempotency_key, approval_id, quote_id, reason, instruction }) =>
+    reply(api("POST", "/api/agent/call", { tool, input, idempotencyKey: idempotency_key ?? randomUUID(), approvalId: approval_id, quoteId: quote_id, reason, instruction })),
 );
 
 server.registerTool(
@@ -755,6 +758,34 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: false },
   },
   ({ description, kind, amount_cents, call_id }) => reply(api("POST", ctl("/incidents"), { description, kind, amountCents: amount_cents, holdId: call_id })),
+);
+
+// ---------------------------------------------------------------- agents selling to agents
+
+server.registerTool(
+  "request_task_quote",
+  {
+    title: "Ask for a price for a task",
+    description:
+      "For tools priced per task (often other agents): send the task, get a price that's good for a while. Free; nothing is held. " +
+      "Then call_paid_tool with the same input and the quoteId. The owner's level, rules and limits apply to the quoted price.",
+    inputSchema: { tool: z.string(), input: z.record(z.string(), z.unknown()).default({}) },
+    annotations: { readOnlyHint: true },
+  },
+  ({ tool, input }) => reply(api("POST", "/api/agent/task-quotes", { tool, input })),
+);
+
+server.registerTool(
+  "get_job",
+  {
+    title: "Check a running job",
+    description:
+      "Status of a call to an async tool: running (money held, not charged), done (with the result and what was charged), or failed (nothing charged). " +
+      "Don't poll more than about once a minute.",
+    inputSchema: { call_id: z.string().describe("The callId from call_paid_tool") },
+    annotations: { readOnlyHint: true },
+  },
+  ({ call_id }) => reply(api("GET", `/api/agent/jobs/${encodeURIComponent(call_id)}`)),
 );
 
 // ---------------------------------------------------------------- purchases

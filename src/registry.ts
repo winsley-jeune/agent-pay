@@ -20,8 +20,12 @@ export interface Tool {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  pricingType: "per_call" | "per_unit";
+  /** quoted: the provider quotes a price per task, up to priceCents. */
+  pricingType: "per_call" | "per_unit" | "quoted";
   priceCents: number;
+  /** async: the provider answers 202 and reports the result later. */
+  mode: "sync" | "async";
+  maxJobSeconds: number | null;
   unitsField: string | null;
   maxUnits: number | null;
   upstreamUrl: string;
@@ -30,7 +34,9 @@ export interface Tool {
 }
 
 export type NewTool = Pick<Tool, "slug" | "name" | "description" | "pricingType" | "priceCents" | "upstreamUrl"> &
-  Partial<Pick<Tool, "inputSchema" | "unitsField" | "maxUnits" | "upstreamAuth">>;
+  Partial<Pick<Tool, "inputSchema" | "unitsField" | "maxUnits" | "upstreamAuth" | "mode" | "maxJobSeconds">>;
+
+export const DEFAULT_MAX_JOB_SECONDS = 3600;
 
 /** What agents and the public catalog see. Never includes the upstream URL or credentials. */
 export function publicTool(t: Tool) {
@@ -42,7 +48,11 @@ export function publicTool(t: Tool) {
     pricing:
       t.pricingType === "per_call"
         ? { type: "per_call" as const, priceCents: t.priceCents }
-        : { type: "per_unit" as const, priceCentsPerUnit: t.priceCents, unitsField: t.unitsField, maxUnits: t.maxUnits },
+        : t.pricingType === "quoted"
+          ? { type: "quoted" as const, maxPriceCents: t.priceCents, note: "ask for a price with request_task_quote, then call with the quoteId" }
+          : { type: "per_unit" as const, priceCentsPerUnit: t.priceCents, unitsField: t.unitsField, maxUnits: t.maxUnits },
+    mode: t.mode,
+    ...(t.mode === "async" ? { maxJobSeconds: t.maxJobSeconds ?? DEFAULT_MAX_JOB_SECONDS } : {}),
     inputSchema: t.inputSchema,
   };
 }
@@ -52,7 +62,7 @@ const providerColumns = `id, user_id AS "userId", name, account_id AS "accountId
 const toolColumns = `t.id, t.provider_id AS "providerId", p.name AS "providerName", t.slug, t.name, t.description,
   t.input_schema AS "inputSchema", t.pricing_type AS "pricingType", t.price_cents AS "priceCents",
   t.units_field AS "unitsField", t.max_units AS "maxUnits", t.upstream_url AS "upstreamUrl",
-  t.upstream_auth AS "upstreamAuth", t.active`;
+  t.upstream_auth AS "upstreamAuth", t.mode, t.max_job_seconds AS "maxJobSeconds", t.active`;
 
 export async function createProvider(db: Db, userId: string, name: string): Promise<Provider> {
   return withTx(db, async (tx) => {
@@ -85,6 +95,9 @@ export async function createTool(db: Db, providerId: string, t: NewTool): Promis
   if (t.pricingType === "per_unit" && !t.unitsField) {
     throw new AppError(400, "invalid_pricing", "per_unit tools need a unitsField");
   }
+  if (t.pricingType === "quoted" && t.priceCents <= 0) {
+    throw new AppError(400, "invalid_pricing", "quoted tools need priceCents: the most a single task can be quoted at");
+  }
   try {
     new URL(t.upstreamUrl);
   } catch {
@@ -93,8 +106,8 @@ export async function createTool(db: Db, providerId: string, t: NewTool): Promis
   const { rows } = await db
     .query(
       `INSERT INTO tools (provider_id, slug, name, description, input_schema, pricing_type, price_cents,
-                          units_field, max_units, upstream_url, upstream_auth)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING slug`,
+                          units_field, max_units, upstream_url, upstream_auth, mode, max_job_seconds)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING slug`,
       [
         providerId,
         t.slug,
@@ -107,6 +120,8 @@ export async function createTool(db: Db, providerId: string, t: NewTool): Promis
         t.maxUnits ?? null,
         t.upstreamUrl,
         t.upstreamAuth ?? null,
+        t.mode ?? "sync",
+        t.mode === "async" ? (t.maxJobSeconds ?? DEFAULT_MAX_JOB_SECONDS) : null,
       ],
     )
     .catch((err) => {
@@ -146,6 +161,9 @@ export async function listTools(q: Db | Tx, opts: { providerId?: string } = {}):
 /** Price for one call with this input, in cents. Throws if the input can't be priced. */
 export function quote(tool: Tool, input: Record<string, unknown>): { amountCents: number; units: number | null } {
   if (tool.pricingType === "per_call") return { amountCents: tool.priceCents, units: null };
+  if (tool.pricingType === "quoted") {
+    throw new AppError(400, "quote_required", `"${tool.slug}" is priced per task: ask for a price with request_task_quote, then call with the quoteId`);
+  }
   const units = input[tool.unitsField!];
   if (typeof units !== "number" || !Number.isInteger(units) || units < 1) {
     throw new AppError(400, "invalid_units", `input.${tool.unitsField} must be a positive integer`);

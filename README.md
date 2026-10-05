@@ -244,6 +244,22 @@ Every order the agent places becomes a **purchase** with a return deadline: groc
 - **Reminders** come three days before the window closes, and for orders not confirmed two days after ordering.
 - **Confirming delivery.** The order stays open until the owner confirms what arrived (`confirm_received`). Missing items mark it as a problem and say what refund to ask the store for. The agent may draft the request, but sends it only with the owner's go-ahead.
 
+## Agents paying agents
+
+An agent that sells its work is listed like any paid tool, by its developer as a provider. Another agent buys from it with `call_paid_tool`, inside its own owner's levels, rules, envelopes and approvals. AgentPay holds the money, calls the selling agent, and charges only if it delivers. There's no transfer from one wallet to another: the buyer pays AgentPay for a service, and the seller is AgentPay's vendor.
+
+- **Signed requests.** Every request to a provider is signed with Ed25519. The signature covers the call, the tool, the cents held, the paying agent's id, a timestamp and the body. Providers check it with [`@winsley-jeune/agentpay-verify`](packages/verify) against `/.well-known/agentpay-keys.json`.
+- **Long-running jobs.** A tool can answer `202` and report later.
+  - The call returns `running` with the money **held, not charged** (up to the tool's `maxJobSeconds`, 1 hour by default).
+  - The provider posts the result to the callback URL with the job token, and AgentPay charges then. A failure, or no answer in time, returns the money.
+  - Agents follow progress with `get_job`.
+- **Prices quoted per task.** A tool priced `quoted` lists a maximum.
+  - The buying agent asks for a price with `request_task_quote`; this is free and nothing is held.
+  - It then calls with the `quoteId`. A quote is good once, for the same input, until it expires, and never above the listed maximum.
+  - The owner's rules apply to the quoted price.
+
+The full provider guide is in [docs/providers.md](docs/providers.md). Not built yet: paying out providers' earnings (Stripe Connect plus legal review), and paying agents outside AgentPay (x402, A2A).
+
 ## Test keys for developers
 
 Create an agent key with **Test key** ticked (or `"test": true`), and it starts with `ap_test_`. A test key:
@@ -302,6 +318,7 @@ The owner can't turn this off; they buy these themselves.
 | `pick_product` / `get_shopping_preferences` | Choose among versions of an item |
 | `check_purchase_policy` | Is this item, tool or site something agents must refuse? |
 | `list_purchases` / `record_purchase` / `confirm_received` | Orders, return deadlines and what arrived |
+| `request_task_quote` / `get_job` | Agents selling to agents: get a price per task, follow a long-running job |
 | `approve_test_call` / `add_test_credits` | Test keys only: approve your own calls, add pretend credits |
 | `request_envelope` | Ask the owner to set money aside for this agent |
 | `report_mistake` | Record an incident the agent caused |

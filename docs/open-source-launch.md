@@ -54,7 +54,7 @@ The repository is **private** and stays private until you decide to flip it. Eve
    - enable **private vulnerability reporting**, Dependabot alerts and secret scanning
    - add a description and these topics: `mcp`, `mcp-server`, `ai-agents`, `agent-payments`, `agentic-commerce`, `claude-code`, `claude-code-plugin`, `spending-controls`, `passkeys`, `webauthn`, `fintech`, `typescript`
 2. **Check CI passes** on GitHub Actions.
-3. **Publish the MCP package:** `npm login`, then `npm publish -w packages/mcp`. The prepublish step builds it.
+3. **Publish the packages:** `npm login`, then `npm publish -w packages/mcp` and `npm publish -w packages/verify`. The prepublish step builds each one.
 4. **List it in the MCP Registry:** install `mcp-publisher`, then `cd packages/mcp && mcp-publisher login github && mcp-publisher publish`.
 5. **Test the plugin as a user:** `claude plugin marketplace add winsley-jeune/agent-pay` and `claude plugin install agentpay@agentpay`.
 6. **Other directories**, once listed in the registry: Smithery, Glama, PulseMCP, mcp.so, and awesome-mcp-servers (open a pull request).

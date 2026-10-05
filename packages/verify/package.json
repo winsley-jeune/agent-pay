@@ -1,0 +1,21 @@
+{
+  "name": "@winsley-jeune/agentpay-verify",
+  "version": "0.1.0",
+  "description": "Verify that a request to your paid tool or agent really comes from AgentPay: which agent is paying, how much is held, and that nothing was changed",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": { "node": ">=20" },
+  "keywords": ["agentpay", "mcp", "ai-agents", "agent-payments", "webhook-verification", "ed25519", "signature"],
+  "homepage": "https://github.com/winsley-jeune/agent-pay/tree/master/packages/verify#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/winsley-jeune/agent-pay.git", "directory": "packages/verify" },
+  "bugs": "https://github.com/winsley-jeune/agent-pay/issues",
+  "license": "MIT",
+  "publishConfig": { "access": "public" }
+}

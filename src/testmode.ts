@@ -15,8 +15,8 @@ import { balance, lockAccount, post, systemAccount } from "./ledger.js";
 export function testKeyAllowed(method: string, path: string): boolean {
   if (path.startsWith("/api/agent/test/")) return true;
   if (method === "GET" && ["/api/agent/tools", "/api/agent/balance", "/api/agent/controls/policy"].includes(path)) return true;
-  if (method === "GET" && /^\/api\/agent\/approvals\/[^/]+$/.test(path)) return true;
-  return method === "POST" && ["/api/agent/quote", "/api/agent/call", "/api/agent/controls/policy/check"].includes(path);
+  if (method === "GET" && /^\/api\/agent\/(approvals|jobs)\/[^/]+$/.test(path)) return true;
+  return method === "POST" && ["/api/agent/quote", "/api/agent/call", "/api/agent/task-quotes", "/api/agent/controls/policy/check"].includes(path);
 }
 
 function requireTest(agentKey: AgentKey) {

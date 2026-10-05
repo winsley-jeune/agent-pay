@@ -34,7 +34,8 @@ import { applyDueChanges, getProtection, helperOn, scheduleAgentLimits } from ".
 import { auditTx } from "./audit.js";
 import { withTx } from "./db.js";
 import { frozenAt, frozenError, releaseVaultUnlocks, sweepEnvelopes } from "./controls.js";
-import { callPaidTool, getToolForAgent, spendSummary, sweepExpiredHolds } from "./gateway.js";
+import { callPaidTool, completeJob, failJob, getJob, getToolForAgent, requestTaskQuote, spendSummary, sweepExpiredHolds } from "./gateway.js";
+import { publicKeys } from "./signing.js";
 import { decideCall } from "./controls.js";
 import { balance, history } from "./ledger.js";
 import { migrate } from "./migrate.js";
@@ -151,6 +152,22 @@ export function createApp(db: Db) {
   // ------------------------------------------------------------ public
 
   app.get("/api/health", h(async () => ({ ok: true })));
+  // Public keys providers verify AgentPay's signed requests with (docs/providers.md).
+  app.get("/.well-known/agentpay-keys.json", h(async () => publicKeys(db)));
+
+  // A provider reports an async job's outcome, authenticated by the job token sent with the call.
+  const jobToken = (req: Request) => bearer(req) ?? "";
+  app.post(
+    "/api/jobs/:callId/complete",
+    h(async (req) => {
+      const { result, units } = parse(z.object({ result: z.unknown().optional(), units: z.number().int().nonnegative().optional() }), req.body);
+      return completeJob(db, String(req.params.callId), jobToken(req), { result, units });
+    }),
+  );
+  app.post(
+    "/api/jobs/:callId/fail",
+    h(async (req) => failJob(db, String(req.params.callId), jobToken(req), parse(z.object({ error: z.string().min(1).max(2000) }), req.body).error)),
+  );
 
   app.get(
     "/api/catalog",
@@ -364,7 +381,9 @@ export function createApp(db: Db) {
           slug,
           name: z.string().min(1).max(80),
           description: z.string().min(1).max(2000),
-          pricingType: z.enum(["per_call", "per_unit"]),
+          pricingType: z.enum(["per_call", "per_unit", "quoted"]),
+          mode: z.enum(["sync", "async"]).optional(),
+          maxJobSeconds: z.number().int().min(60).max(86_400).optional(),
           priceCents: cents,
           unitsField: z.string().max(64).optional(),
           maxUnits: z.number().int().positive().optional(),
@@ -468,6 +487,7 @@ export function createApp(db: Db) {
           approvalId: z.uuid().optional(),
           reason: z.string().max(500).optional(),
           instruction: z.string().max(500).optional(),
+          quoteId: z.uuid().optional(),
         }),
         req.body,
       );
@@ -475,6 +495,15 @@ export function createApp(db: Db) {
     }),
   );
   app.get("/api/agent/balance", agentOnly, h(async (req) => spendSummary(db, req.agentKey!)));
+  app.get("/api/agent/jobs/:callId", agentOnly, h(async (req) => getJob(db, req.agentKey!, String(req.params.callId))));
+  app.post(
+    "/api/agent/task-quotes",
+    agentOnly,
+    h(async (req) => {
+      const { tool, input } = parse(z.object({ tool: z.string(), input: z.record(z.string(), z.unknown()).default({}) }), req.body);
+      return requestTaskQuote(db, req.agentKey!, tool, input);
+    }),
+  );
   app.get("/api/agent/approvals/:id", agentOnly, h(async (req) => approvalStatusForAgent(db, req.agentKey!, String(req.params.id))));
   app.get(
     "/api/agent/plans",
