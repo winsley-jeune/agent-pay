@@ -99,7 +99,8 @@ export const readListWithClaude: PhotoReader = async (imageBase64, mediaType) =>
     if (err instanceof Anthropic.RateLimitError) throw new AppError(503, "claude_busy", "photo reading is busy; try again in a minute");
     if (err instanceof Anthropic.BadRequestError) throw new AppError(400, "photo_rejected", `the photo couldn't be read: ${err.message}`);
     if (err instanceof Anthropic.APIError) throw new AppError(502, "claude_error", `photo reading failed (${err.status})`);
-    throw err;
+    // Anything else failed before a request was sent, most often no API key or login on this server.
+    throw new AppError(503, "claude_unavailable", `photo reading isn't set up on this server (set ANTHROPIC_API_KEY): ${(err as Error).message}`);
   }
   if (response.stop_reason === "refusal") throw new AppError(422, "photo_refused", "this photo couldn't be processed; type the list instead");
   if (!response.parsed_output) throw new AppError(502, "photo_unparsed", "couldn't turn the photo into a list; try a clearer photo or type it");
