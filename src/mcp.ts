@@ -47,7 +47,12 @@ const server = new McpServer(
       "add_subscription, import_bank_statement and savings_ideas. Those are billed by the merchant, not AgentPay. " +
       "Never cancel one without request_cancel first; the owner approves, then follow cancel_guide and record it with mark_canceled. " +
       "Price watch and groceries: read prices and fill carts only in the owner's own browser, never bypass a store's bot protection, " +
-      "never buy a watched item yourself, and never check out a grocery order until request_order_approval is approved and the checkout total is within the approved maximum.",
+      "never buy a watched item yourself, and never check out a grocery order until request_order_approval is approved and the checkout total is within the approved maximum. " +
+      "Before acting on any website, call check_browser_access for that site and action; if it isn't allowed, ask with request_browser_access and wait. " +
+      "Only use sessions the owner is already signed in to: never type a password or sign-in code and never complete a sign-in; if a site asks you to sign in, stop and ask the owner to sign in themselves. " +
+      "Never open payment settings, never read, copy or record card numbers or other payment details (not even the last four digits), and never change the payment method at checkout; " +
+      "if checkout asks for payment details, stop and ask the owner. Record what you do with log_browser_activity. " +
+      "When a store shows several versions of an item, send what you see to pick_product and follow its choice unless it says ask_owner.",
   },
 );
 
@@ -531,6 +536,99 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
   ({ list_id, total_cents, order_number }) => reply(api("POST", gr(`/${encodeURIComponent(list_id)}/ordered`), { totalCents: total_cents, orderNumber: order_number })),
+);
+
+// ---------------------------------------------------------------- permissions and product choice
+
+const pm = (path = "") => `/api/agent/permissions${path}`;
+const browserAction = z.enum(["browse", "add_to_cart", "checkout_approved_order", "manage_subscription"]);
+
+server.registerTool(
+  "check_browser_access",
+  {
+    title: "May I act on this site?",
+    description:
+      "Check before doing anything on a website in the owner's browser. Returns allowed, needs_consent, needs_grant, expired or revoked. " +
+      "Only 'allowed' means go ahead.",
+    inputSchema: { site: z.string().describe("e.g. walmart.com or a page URL"), action: browserAction },
+    annotations: { readOnlyHint: true },
+  },
+  ({ site, action }) => reply(api("GET", pm(`/check?site=${encodeURIComponent(site)}&action=${action}`))),
+);
+
+server.registerTool(
+  "request_browser_access",
+  {
+    title: "Ask to use a signed-in site",
+    description:
+      "Ask the owner for permission to use their already-signed-in session on a site for specific actions. They approve with their passkey. " +
+      "Ask only for what the task needs (e.g. browse + add_to_cart to fill a cart; checkout_approved_order only when an order is approved).",
+    inputSchema: { site: z.string(), actions: z.array(browserAction).min(1), reason: z.string().max(300), days: z.number().int().min(1).max(365).optional() },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ site, actions, reason, days }) => reply(api("POST", pm("/request"), { site, actions, reason, days })),
+);
+
+server.registerTool(
+  "log_browser_activity",
+  {
+    title: "Record what you did on a site",
+    description: "Log each meaningful action (searched, added to cart, removed, checked out) so the owner can review it. Never include payment details.",
+    inputSchema: { site: z.string(), action: browserAction, summary: z.string().max(500) },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  ({ site, action, summary }) => reply(api("POST", pm("/activity"), { site, action, summary })),
+);
+
+server.registerTool(
+  "get_shopping_preferences",
+  {
+    title: "The owner's shopping preferences",
+    description: "Organic, store brand, size strategy, favourite and avoided brands, dietary needs, minimum rating and what to do when an item is missing.",
+    annotations: { readOnlyHint: true },
+  },
+  () => reply(api("GET", pm("/preferences"))),
+);
+
+server.registerTool(
+  "pick_product",
+  {
+    title: "Choose among versions of an item",
+    description:
+      "When a store search shows several versions of a list item (e.g. 'carrots': 1 lb, 2 lb, baby, organic, carrot cake), send the options you see. " +
+      "AgentPay picks one using the owner's preferences, what they bought before, the quantity on the list and price per unit, " +
+      "and says how many packs to add. Follow the choice unless ask_owner is true.",
+    inputSchema: {
+      list_id: z.string(),
+      item_id: z.number().int(),
+      candidates: z
+        .array(
+          z.object({
+            name: z.string().describe("Product title as shown"),
+            price_cents: z.number().int().positive(),
+            size_text: z.string().optional().describe("e.g. '2 lb', '12 ct', '1 gal'"),
+            brand: z.string().optional(),
+            organic: z.boolean().optional(),
+            rating: z.number().min(0).max(5).optional(),
+            in_stock: z.boolean().optional(),
+            url: z.string().optional(),
+            dietary_tags: z.array(z.string()).optional().describe("e.g. gluten-free, vegan, as labelled on the page"),
+          }),
+        )
+        .min(1)
+        .max(60),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  ({ list_id, item_id, candidates }) =>
+    reply(
+      api("POST", gr(`/${encodeURIComponent(list_id)}/items/${item_id}/pick`), {
+        candidates: candidates.map((c) => ({
+          name: c.name, priceCents: c.price_cents, sizeText: c.size_text, brand: c.brand, organic: c.organic, rating: c.rating,
+          inStock: c.in_stock, url: c.url, dietaryTags: c.dietary_tags,
+        })),
+      }),
+    ),
 );
 
 await server.connect(new StdioServerTransport());

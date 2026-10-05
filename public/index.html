@@ -107,7 +107,7 @@ function renderLogin() {
 }
 
 // ------------------------------------------------------------------ shell
-const tabs = [["all", "All subscriptions"], ["watch", "Price watch"], ["grocery", "Groceries"], ["wallet", "Wallet"], ["approvals", "Approvals"], ["subscriptions", "Agent plans"], ["agents", "Agent keys"], ["security", "Passkeys"], ["provider", "Sell tools"]];
+const tabs = [["all", "All subscriptions"], ["watch", "Price watch"], ["grocery", "Groceries"], ["perms", "Permissions"], ["wallet", "Wallet"], ["approvals", "Approvals"], ["subscriptions", "Agent plans"], ["agents", "Agent keys"], ["security", "Passkeys"], ["provider", "Sell tools"]];
 
 async function boot() {
   if (!token) return renderLogin();
@@ -142,7 +142,7 @@ function show(name) {
   tab = tabs.some(([k]) => k === name) ? name : "all";
   document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.tab === tab));
   document.querySelectorAll("main section").forEach((s) => s.classList.toggle("active", s.id === "tab-" + tab));
-  ({ all, watch, grocery, wallet, approvals, subscriptions, agents, security, provider })[tab]().catch((e) => toast(e.message));
+  ({ all, watch, grocery, perms, wallet, approvals, subscriptions, agents, security, provider })[tab]().catch((e) => toast(e.message));
 }
 
 // ------------------------------------------------------------------ all subscriptions
@@ -428,6 +428,64 @@ function groceryDetail(l) {
     ${l.status === "ordered" ? `<p class="small">Ordered${l.orderNumber ? ` · #${esc(l.orderNumber)}` : ""} · ${usd(l.orderedTotalCents)} · ${date(l.orderedAt)}</p>` : ""}
     ${l.storeNote ? `<p class="small muted">${esc(l.storeNote)}</p>` : ""}
   </div>`;
+}
+
+// ------------------------------------------------------------------ permissions
+const actionLabels = { browse: "browse", add_to_cart: "fill the cart", checkout_approved_order: "check out approved orders", manage_subscription: "manage subscriptions" };
+const grantState = { active: "ok", pending: "warn", expired: "bad", revoked: "bad", denied: "bad" };
+
+async function perms() {
+  const el = $("#tab-perms");
+  const p = await api("GET", "/api/permissions");
+  const pref = p.preferences;
+  const sel = (name, options, value) => `<select name="${name}">${options.map(([v, l]) => `<option value="${v}" ${v === value ? "selected" : ""}>${l}</option>`).join("")}</select>`;
+  el.innerHTML = `
+    <div class="card"><h3>${esc(p.statement.title)}</h3>
+      ${p.statement.paragraphs.map((t) => `<p class="small">${esc(t)}</p>`).join("")}
+      ${p.consent
+        ? `<div class="row"><span class="chip ok">You accepted this on ${date(p.consent.createdAt)}</span><button class="danger" id="withdraw">Withdraw and revoke all site permissions</button></div>`
+        : `<button class="primary" id="consent">I understand, sign with my passkey</button>`}
+    </div>
+    <div class="card"><h3>Sites your agent may use</h3>
+      <p class="small muted">Your agent uses sessions you're already signed in to in your browser. It never types passwords or sign-in codes and never sees payment details. Agents ask for access; you approve each site in Approvals.</p>
+      <table><tr><th>Site</th><th>Allowed to</th><th>Until</th><th>Status</th><th></th></tr>
+      ${p.grants.map((g) => `<tr><td><b>${esc(g.site)}</b>${g.reason ? `<div class="small muted">${esc(g.reason)}</div>` : ""}</td>
+        <td class="small">${g.actions.map((a) => esc(actionLabels[a] ?? a)).join(", ")}</td><td class="small">${new Date(g.expiresAt).toLocaleDateString()}</td>
+        <td><span class="chip ${grantState[g.state]}">${g.state}</span></td>
+        <td>${g.state === "active" || g.state === "pending" ? `<button class="danger" data-revoke-grant="${g.id}">Revoke</button>` : ""}</td></tr>`).join("") || `<tr><td colspan="5" class="muted">None yet.</td></tr>`}
+      </table></div>
+    <div class="card"><h3>Shopping preferences</h3>
+      <p class="small muted">Used when a store has many versions of an item, like carrots: loose, 2 lb bag, baby, organic. Your agent also reuses what you bought before.</p>
+      <div class="grid" id="prefs">
+        <label>Organic${sel("organic", [["no_preference", "No preference"], ["prefer", "Prefer organic"], ["avoid", "Avoid organic"]], pref.organic)}</label>
+        <label>Store brand${sel("storeBrand", [["ok", "Fine"], ["prefer", "Prefer store brand"], ["avoid", "Avoid store brand"]], pref.storeBrand)}</label>
+        <label>Package size${sel("sizeStrategy", [["match_list", "Match my list"], ["best_value", "Best price per unit"], ["smallest", "Smallest package"]], pref.sizeStrategy)}</label>
+        <label>If something's missing${sel("substitutionPolicy", [["similar", "Pick something similar"], ["ask", "Ask me"], ["skip", "Skip it"]], pref.substitutionPolicy)}</label>
+        <label>Favourite brands<input name="brandsPrefer" value="${esc(pref.brandsPrefer.join(", "))}" placeholder="e.g. Horizon, Dave's Killer Bread"></label>
+        <label>Brands to avoid<input name="brandsAvoid" value="${esc(pref.brandsAvoid.join(", "))}"></label>
+        <label>Dietary needs<input name="dietary" value="${esc(pref.dietary.join(", "))}" placeholder="e.g. gluten-free, vegan"></label>
+        <label>Minimum rating<input name="minRating" type="number" min="0" max="5" step="0.1" value="${pref.minRating}"></label>
+      </div><div class="row" style="margin-top:8px"><button class="primary" id="saveprefs">Save preferences</button></div>
+    </div>
+    <div class="card"><h3>What your agent did</h3><div class="table-wrap"><table>
+      ${p.activity.map((a) => `<tr><td class="small muted">${date(a.createdAt)}</td><td>${esc(a.site)}</td><td class="small">${esc(actionLabels[a.action] ?? a.action)}</td>
+        <td class="small">${esc(a.summary)}</td><td>${a.allowed ? "" : `<span class="chip bad">not allowed</span>`}</td></tr>`).join("") || `<tr><td class="muted">Nothing yet.</td></tr>`}
+    </table></div></div>`;
+  const on = (sel, fn) => $(sel) && ($(sel).onclick = act(fn));
+  on("#consent", async () => {
+    const { approvalId } = await api("POST", "/api/permissions/consent");
+    if (await approveWithPasskey(approvalId)) toast("Thanks. You can now approve site permissions.");
+    await refreshCounts(); perms();
+  });
+  on("#withdraw", async () => { await api("POST", "/api/permissions/consent/withdraw"); toast("Withdrawn. All site permissions are revoked."); perms(); });
+  on("#saveprefs", async () => {
+    const f = (n) => $(`#prefs [name=${n}]`).value;
+    const list = (n) => f(n).split(",").map((s) => s.trim()).filter(Boolean);
+    await api("PUT", "/api/permissions/preferences", { organic: f("organic"), storeBrand: f("storeBrand"), sizeStrategy: f("sizeStrategy"), substitutionPolicy: f("substitutionPolicy"),
+      brandsPrefer: list("brandsPrefer"), brandsAvoid: list("brandsAvoid"), dietary: list("dietary"), minRating: Number(f("minRating")) });
+    toast("Preferences saved.");
+  });
+  el.querySelectorAll("[data-revoke-grant]").forEach((b) => (b.onclick = act(async () => { await api("DELETE", `/api/permissions/grants/${b.dataset.revokeGrant}`); toast("Revoked."); perms(); })));
 }
 
 // ------------------------------------------------------------------ wallet

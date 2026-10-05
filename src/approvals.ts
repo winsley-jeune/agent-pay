@@ -8,9 +8,10 @@ import { hasPasskey, startApprovalSignature, verifyApprovalSignature } from "./p
 import type { Tool } from "./registry.js";
 import { approveExternalCancel, denyExternalCancel } from "./external.js";
 import { approveGroceryOrder, denyGroceryOrder } from "./grocery.js";
+import { ACTION_LABELS, activateGrant, denyGrant, recordConsent, RISK_STATEMENT, type BrowserAction } from "./permissions.js";
 import { activateSubscription, resumeSubscription } from "./subscriptions.js";
 
-export type ApprovalKind = "call" | "subscription" | "resume" | "external_cancel" | "grocery_order";
+export type ApprovalKind = "call" | "subscription" | "resume" | "external_cancel" | "grocery_order" | "risk_consent" | "browser_access";
 
 export interface Approval {
   id: string;
@@ -44,6 +45,11 @@ const approvalFrom = `approvals ap
 /** Human-readable line shown on the approval screen and bound into the passkey challenge. */
 export function describeApproval(a: Pick<Approval, "kind" | "amountCents" | "tool" | "plan" | "interval" | "externalName" | "input">): string {
   const dollars = `$${(a.amountCents / 100).toFixed(2)}`;
+  if (a.kind === "risk_consent") return `I understand the risks: ${RISK_STATEMENT.title.toLowerCase()} (version ${(a.input as { version?: number }).version})`;
+  if (a.kind === "browser_access") {
+    const i = a.input as { site?: string; actions?: BrowserAction[]; days?: number };
+    return `Let my agent use my signed-in ${i.site} to ${(i.actions ?? []).map((x) => ACTION_LABELS[x]).join(", ")}, for ${i.days} days`;
+  }
   if (a.kind === "grocery_order") {
     const i = a.input as { title?: string; store?: string; items?: number; maxCents?: number };
     const store = i.store === "whole_foods" ? "Whole Foods" : "Walmart";
@@ -120,7 +126,7 @@ export async function approve(
   return withTx(db, async (tx) => {
     const { rows } = await tx.query(
       `SELECT id, kind, status, amount_cents AS "amountCents", subscription_id AS "subscriptionId",
-              external_subscription_id AS "externalSubscriptionId", grocery_list_id AS "groceryListId", input
+              external_subscription_id AS "externalSubscriptionId", grocery_list_id AS "groceryListId", browser_grant_id AS "browserGrantId", input
          FROM approvals WHERE id = $1 AND user_id = $2 FOR UPDATE`,
       [id, userId],
     );
@@ -146,6 +152,12 @@ export async function approve(
     } else if (approval.kind === "external_cancel") {
       await approveExternalCancel(tx, approval.externalSubscriptionId);
       newStatus = "used";
+    } else if (approval.kind === "risk_consent") {
+      await recordConsent(tx, userId, approval.input?.version, passkeyId);
+      newStatus = "used";
+    } else if (approval.kind === "browser_access") {
+      await activateGrant(tx, userId, approval.browserGrantId);
+      newStatus = "used";
     } else if (approval.kind === "grocery_order") {
       await approveGroceryOrder(tx, approval.groceryListId, approval.input ?? {});
       newStatus = "used";
@@ -162,7 +174,7 @@ export async function deny(db: Db, userId: string, id: string) {
       `UPDATE approvals SET status = 'denied', decided_at = now()
         WHERE id = $1 AND user_id = $2 AND status = 'pending'
         RETURNING kind, subscription_id AS "subscriptionId", external_subscription_id AS "externalSubscriptionId",
-                  grocery_list_id AS "groceryListId", input`,
+                  grocery_list_id AS "groceryListId", browser_grant_id AS "browserGrantId", input`,
       [id, userId],
     );
     if (!rows[0]) throw new AppError(404, "not_found", "no pending approval with that id");
@@ -170,6 +182,7 @@ export async function deny(db: Db, userId: string, id: string) {
       await tx.query("UPDATE subscriptions SET status = 'denied' WHERE id = $1 AND status = 'pending_approval'", [rows[0].subscriptionId]);
     }
     if (rows[0].kind === "grocery_order") await denyGroceryOrder(tx, rows[0].groceryListId);
+    if (rows[0].kind === "browser_access") await denyGrant(tx, rows[0].browserGrantId);
     if (rows[0].kind === "external_cancel") {
       await denyExternalCancel(tx, rows[0].externalSubscriptionId, rows[0].input?.previousStatus);
     }

@@ -15,9 +15,12 @@ import {
   requestOrderApproval,
   updateItem,
   updateList,
+  type GroceryItem,
   type PhotoReader,
 } from "./grocery.js";
+import { AppError } from "./errors.js";
 import { h, parse } from "./http.js";
+import { getPreferences, memoryFor, pickProduct } from "./shopping.js";
 
 const store = z.enum(["walmart", "whole_foods"]);
 const item = z.object({
@@ -80,6 +83,38 @@ export function groceryRoutes(db: Db, as: "owner" | "agent", readPhoto: PhotoRea
         req.body,
       );
       return { list: await updateItem(db, userId(req), String(req.params.id), Number(req.params.itemId), u) };
+    }),
+  );
+  r.post(
+    "/:id/items/:itemId/pick",
+    h(async (req) => {
+      const { candidates } = parse(
+        z.object({
+          candidates: z
+            .array(
+              z.object({
+                name: z.string().min(1).max(300),
+                priceCents: z.number().int().positive(),
+                sizeText: z.string().max(100).nullable().optional(),
+                brand: z.string().max(100).nullable().optional(),
+                organic: z.boolean().nullable().optional(),
+                storeBrand: z.boolean().nullable().optional(),
+                rating: z.number().min(0).max(5).nullable().optional(),
+                inStock: z.boolean().nullable().optional(),
+                url: z.string().max(2000).nullable().optional(),
+                dietaryTags: z.array(z.string().max(40)).max(20).nullable().optional(),
+              }),
+            )
+            .min(1)
+            .max(60),
+        }),
+        req.body,
+      );
+      const list = await getList(db, userId(req), String(req.params.id));
+      const item = (list.items as GroceryItem[]).find((i) => i.id === Number(req.params.itemId));
+      if (!item) throw new AppError(404, "not_found", "item not found on this list");
+      const memory = list.store ? await memoryFor(db, userId(req), list.store, item.name) : null;
+      return pickProduct(item, await getPreferences(db, userId(req)), memory, candidates);
     }),
   );
   r.post("/:id/request-approval", h(async (req) => requestOrderApproval(db, userId(req), String(req.params.id), agentKey(req))));

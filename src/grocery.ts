@@ -5,6 +5,7 @@ import type { AgentKey } from "./auth.js";
 import type { Db, Tx } from "./db.js";
 import { withTx } from "./db.js";
 import { AppError } from "./errors.js";
+import { rememberPurchases } from "./shopping.js";
 
 // Grocery lists: typed, or read from a photo with Claude. The owner's agent
 // fills the cart at Walmart or Whole Foods in the owner's own browser and
@@ -389,6 +390,7 @@ export async function markOrdered(db: Db, userId: string, listId: string, input:
     await tx.query("UPDATE grocery_lists SET status = 'ordered', order_number = $2, ordered_total_cents = $3, ordered_at = now() WHERE id = $1", [
       listId, input.orderNumber?.slice(0, 80) ?? null, input.totalCents,
     ]);
+    await rememberPurchases(tx, userId, listId);
     return getList(tx, userId, listId);
   });
 }

@@ -23,6 +23,7 @@ import { rollRenewalDates } from "./external.js";
 import { expireWatches, refreshFromKeepa } from "./pricewatch.js";
 import { priceWatchRoutes } from "./pricewatch-routes.js";
 import { groceryRoutes } from "./grocery-routes.js";
+import { permissionsRoutes } from "./permissions-routes.js";
 import { callPaidTool, getToolForAgent, spendSummary, sweepExpiredHolds } from "./gateway.js";
 import { balance, history } from "./ledger.js";
 import { migrate } from "./migrate.js";
@@ -453,6 +454,8 @@ export function createApp(db: Db) {
   app.use("/api/agent/price-watch", agentOnly, priceWatchRoutes(db, "agent"));
   app.use("/api/grocery", ownerOnly, groceryRoutes(db, "owner"));
   app.use("/api/agent/grocery", agentOnly, groceryRoutes(db, "agent"));
+  app.use("/api/permissions", ownerOnly, permissionsRoutes(db, "owner"));
+  app.use("/api/agent/permissions", agentOnly, permissionsRoutes(db, "agent"));
 
   // ------------------------------------------------------------ demo provider + dashboard
 

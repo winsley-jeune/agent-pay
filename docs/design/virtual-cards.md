@@ -1,92 +1,94 @@
-# Design: virtual cards, so AgentPay can actually pay
+# Design: prepaid virtual cards, so AgentPay can actually pay
 
-Status: proposal, not built. Needs a business decision before any code (see "Before we build").
+Status: decisions made (below); not built. Building waits on the Stripe Issuing application and a legal review (see "Before we build").
 
-## Why
+## Decisions (settled 2026-10-05)
 
-Today AgentPay only moves money for tools and plans sold inside its own marketplace. Everything else is tracked but paid elsewhere:
+1. **The agent never knows any payment information.** No card numbers, no expiry, no CVC, not even the last four digits. The agent never opens payment settings and never changes the payment method at checkout.
+2. **Always prepaid.** A card can only spend credits already in the owner's wallet. No overdraft, no credit.
+3. **The owner is the cardholder** of their AgentPay cards. This is the heavier identity-check (KYC) path, and it's accepted.
+4. **The owner must understand the risk first.** Before any card or site permission, the owner reads a plain risk statement and signs it with their passkey. This is built: `src/permissions.ts` (`RISK_STATEMENT`, versioned). A lawyer should review the wording before launch.
+5. **Agents use the owner's own signed-in browser, with per-site permission.** The owner allows a site and specific actions (browse, fill the cart, check out approved orders, manage subscriptions), with an expiry, revocable at any time. The agent never types passwords or sign-in codes; if a site isn't signed in, it stops and asks the owner. This is built: Permissions page, `check_browser_access` / `request_browser_access` MCP tools, activity log.
 
-| Feature | What happens today | With virtual cards |
-|---|---|---|
-| Everyday subscriptions (Netflix, gym...) | Charged to the owner's own card; AgentPay reminds and guides | Each subscription gets its own card, funded from the wallet, with its own monthly limit |
-| Grocery orders | Owner approves the total; the agent checks out with whatever card is saved at the store, and AgentPay can only *ask* it to stay within the total | A single-use card locked to the store, valid only up to the approved total. The limit is enforced by the card network, not by trust |
-| Price watch | Alerts when the target is reached; the owner buys | "Buy now" approval issues a single-use card for that one purchase |
+## The card model these decisions lead to
 
-The idea is one card per purpose, so a leak, a price hike, or an agent mistake can only touch that one card's limit.
+Because the agent can't type a card number, there are no "cards the agent fills in". Instead:
 
-## How it fits what exists
+- **One persistent AgentPay card per store or subscription**, saved by the owner themselves. In the dashboard, Stripe Issuing Elements shows the number to the owner only, and the owner adds it to walmart.com, Netflix and so on, ideally named "AgentPay" at the store and set as the default.
+  - The number never touches AgentPay's servers.
+  - The agent never sees it.
+- **Locked at the card network** to that merchant (`spending_controls`: allowed categories and merchant), with a spending limit.
+- **Each charge is approved in real time only if something the owner approved matches it.** The card is persistent, but each authorization is effectively single-use:
 
-The wallet ledger stays the source of truth for *policy* (who may spend what). The card issuer holds the *real money*. Every card event maps onto the hold/capture/release cycle that paid tool calls already use:
+| Card for | A charge is approved only if |
+|---|---|
+| A store (grocery orders, price-watch purchases) | It matches an order the owner approved with their passkey: same merchant, amount within the approved maximum (estimate + 15%), within 24 hours of approval. One charge per approval. |
+| A subscription (Netflix, gym...) | It's within the subscription's price ceiling, at most once per billing period. A price increase is declined and the owner is asked to approve the new price. |
+
+So even if the agent picked the wrong items or tried to check out twice, the card itself refuses anything the owner didn't approve. The wallet balance is a hard ceiling on top.
+
+**At checkout, the agent's rule:** use the payment method the store already has selected. If the store asks for payment details, or the selected method isn't the owner's AgentPay card (shown by the nickname the owner chose, never by number), stop and ask the owner. This is a rule the agent follows, written into the MCP server instructions. The enforcement is the card: a charge on the owner's personal card doesn't go through AgentPay at all. That's the one gap: if the agent picks the owner's personal card at checkout, AgentPay can't stop it. Owners should make the AgentPay card the store's default and keep personal cards off stores they let agents use. The risk statement says this.
+
+## How a charge flows
 
 ```
- Merchant charges card ──► Stripe Issuing ──► issuing_authorization.request (webhook, must answer in ~2s)
-                                                │
-                                                ▼
-                              AgentPay decides with the existing wallet lock:
-                              card active? right merchant? within card limit?
-                              within wallet balance? ──► approve + ledger "card_hold"
-                                                      └► decline (reason logged, owner notified)
-                                                │
- Merchant settles ──► issuing_transaction.created ──► ledger "card_capture" (amount may differ from hold)
- Auth expires/reversed ──► issuing_authorization.updated ──► ledger "card_release"
- Refund ──► negative transaction ──► ledger "refund" back to the wallet
+ Store charges the AgentPay card ──► Stripe Issuing ──► issuing_authorization.request (webhook, answer within ~2 s)
+                                                          │
+                                                          ▼
+                                   AgentPay decides under the existing wallet lock:
+                                   card active? merchant matches? an approved order / subscription
+                                   period it matches? amount within approval? enough prepaid credit?
+                                   ──► approve + ledger "card_hold" (mark the approval used)
+                                   └─► decline (reason logged, owner notified)
+                                                          │
+ Store settles ──► issuing_transaction.created ──► ledger "card_capture" (amount can differ slightly)
+ Auth expires / reversed ──► issuing_authorization.updated ──► ledger "card_release"
+ Refund ──► negative transaction ──► ledger "refund" to the wallet
 ```
 
-The 2-second answer window is the main engineering constraint: the decision path can only do the wallet lock, a few indexed reads and the ledger insert. That's already how `placeHold` in `src/gateway.ts` works. No calls to other services, no LLM, no passkey prompt in that path; anything that needs a human happens *before*, when the card is created or its limit raised.
-
-Two layers of limits, on purpose:
-
-1. **On the card at the issuer** (Stripe `spending_controls`: allowed merchant categories, per-authorization and monthly `spending_limits`). These hold even if AgentPay is down or buggy.
-2. **In AgentPay's decision** (exact merchant match, wallet balance, subscription price ceiling, single-use flag). Finer-grained, and recorded in the ledger.
+The ~2 second answer window means no human, no passkey and no outside calls in that path: just the wallet lock, indexed lookups and a ledger insert. That's already how `placeHold` in `src/gateway.ts` works. Everything human happens beforehand (approving the order, the subscription price, the card itself).
 
 ## Data model (new)
 
-- `cards`: id, user_id, issuer_card_id, purpose (`subscription` | `grocery_order` | `purchase`), link to the `external_subscriptions` / `grocery_lists` / `price_watches` row, merchant lock (name pattern and category), `limit_cents` + interval (`per_month` or `single_use`), status (`active` | `paused` | `closed`), last4, created_at.
-- `card_authorizations`: issuer authorization id (unique, for idempotency, since webhooks can arrive twice), card_id, amount, merchant as reported, decision, decline reason, hold_id.
-- Ledger types: `card_hold`, `card_capture`, `card_release`; a `card_funding` system account for money moved to the issuer.
-- Approval kinds: `card_create`, `card_limit_raise`. Signed with the owner's passkey like subscriptions. The summary states the ceiling: "Create a card for Netflix, up to $20.00 a month".
+- `cards`: user_id, issuer_card_id, purpose (`store` | `subscription`), merchant lock (name pattern and category), link to the `external_subscriptions` row for subscription cards, owner's nickname, limit, status (`active` | `paused` | `closed`). **No card number, expiry or CVC columns, ever.**
+- `card_authorizations`: issuer authorization id (unique, because webhooks can arrive twice), card_id, amount, merchant as reported, decision, decline reason, matched approval id, hold_id.
+- Ledger types `card_hold`, `card_capture`, `card_release`; a `card_funding` system account for credits moved to the issuer.
+- Approval kinds `card_create` and `card_limit_raise`, passkey-signed. Grocery-order and subscription approvals gain an "authorizes one card charge" meaning.
 
 ## Lifecycle
 
-- **Create.** From a tracked subscription ("Pay Netflix with an AgentPay card"), an approved grocery order, or a price-watch "buy". Needs a passkey approval. Single-use cards close themselves after one capture or 7 days.
-- **Using the card number.** Who types it into Netflix or Walmart is a policy choice (below). The number is shown with Stripe Issuing Elements, so it never touches AgentPay's servers or database.
-- **Pause / resume.** Instantly stops new charges. **Pausing is not cancelling.** For contract services (phone carriers, gyms, Adobe) the app must repeat the contract warning AgentPay already shows, and ask the owner to confirm they understand the bill is still owed. Otherwise a paused AT&T card leads to late fees and collections.
-- **Price above the ceiling.** If Netflix raises the price, the authorization is declined, and the owner gets "Netflix tried to charge $19.99; your limit is $17.99. Approve the new price?" This is the existing `price_above_owner_limit` flow, now enforced on real money.
-- **Close.** When a subscription is cancelled, close its card. Any later charge is declined automatically, which also covers the "still charged after cancel" case the bank import detects today.
+- **Create.** From the Permissions or subscriptions page. Needs the current risk consent and a passkey approval that states the merchant and limit ("AgentPay card for walmart.com, prepaid, up to $150 per approved order").
+- **Pause / resume.** Instantly stops new charges. **Pausing is not cancelling.** For contract services (phone carriers, gyms, Adobe) the app repeats the contract warning AgentPay already shows and asks the owner to confirm the bill is still owed. Otherwise a paused AT&T card leads to late fees and collections.
+- **Close.** When a subscription is cancelled, close its card. Later charges are declined, which also catches the "still charged after cancel" case the bank import detects today.
 
 ## Money and reconciliation
 
-Card spending comes out of the issuer's balance, not out of our ledger. So:
-
-- Card top-ups from owners (already Stripe) must be moved into the Issuing balance, either automatically above a threshold or on a schedule.
-- A daily reconciliation job compares the sum of ledger `card_*` entries with the issuer's transactions and balance, and alerts on any difference. This is where the two systems can drift (late captures, partial captures, refunds, disputes). It needs to exist before real money flows.
-- Disputes and chargebacks need a manual process at first.
-
-## Policy decisions for you
-
-1. **Can an agent see a card number?** Recommended: only for single-use cards (grocery and price-watch purchases), which are locked to one merchant and one approved amount, so the worst case is bounded. For subscription cards, the owner enters the number themselves, via the Issuing Elements view.
-2. **Funding model.** Prepaid only, where the wallet must hold the money first (recommended, matches today), or allow a small overdraft for subscription renewals.
-3. **Who is the cardholder?** Each owner as an individual cardholder (more KYC, cleaner liability) or the business as the cardholder (simpler; check whether the program allows it for consumer use).
+- Owners' prepaid top-ups (already through Stripe) are moved into the Issuing balance, either automatically above a threshold or on a schedule.
+- A daily reconciliation job compares ledger `card_*` entries with the issuer's transactions and balance, and alerts on any difference (late or partial captures, refunds, disputes). It must exist before real money flows.
+- Disputes and chargebacks: a manual process at first.
 
 ## Before we build: things to confirm (can't be verified from here)
 
-- **Stripe Issuing approval.** It needs an application and Stripe's approval. Availability is limited to certain countries and business types. Check Stripe's Issuing eligibility page and talk to Stripe sales.
-- **Cost.** Per-card and per-transaction fees: Stripe Issuing pricing page. One card per subscription multiplies card count.
-- **Compliance.**
-  - Cardholder identity checks (KYC) and accepting the issuing bank's terms.
-  - Holding customer money on prepaid balances can make AgentPay a money transmitter or stored-value provider in some places; this needs a lawyer's answer, not an engineering one. It's the same question as provider payouts.
-- **Test mode.** Stripe offers Issuing in test mode once it's enabled on the account. Build and test entirely there first.
-- **Webhook timeout behavior.** What Stripe does if we don't answer an authorization in time (approve or decline), and how to configure it. Confirm in Stripe's Issuing docs before designing the failure mode.
+- **Stripe Issuing.**
+  - Needs an application and Stripe's approval. Availability is limited by country and business type, so check Stripe's Issuing eligibility page and talk to Stripe.
+  - Confirm that consumer cardholders (decision 3) are allowed under the program Stripe offers.
+- **Cost.** Per-card and per-transaction fees: Stripe Issuing pricing page.
+- **Legal.**
+  - Holding customers' prepaid money can make AgentPay a money transmitter or stored-value provider in some places.
+  - Cardholder KYC and terms.
+  - The risk statement's wording.
+  - These need a lawyer, not an engineer.
+- **Test mode.** Issuing has a test mode once enabled on the account. Build and test entirely there first.
+- **Webhook timeout behavior.** What Stripe does if we don't answer an authorization in time, and how to configure it. Confirm in the Issuing docs before designing the failure mode.
 
 ## Alternatives
 
-- **Lithic or Marqeta.** The same model (issuing API plus real-time authorization webhook) from card-issuing platforms. Worth a quote comparison, since the design above transfers almost unchanged.
-- **Privacy.com.** A consumer product for one person's own cards, not a platform for issuing cards to our users. Useful as a reference, not as a foundation.
-- **No issuing.** Stay with track, remind, guide and approve. Zero compliance cost. The agent's spending outside the marketplace is then limited by trust and approvals, not by the card network.
+- **Lithic or Marqeta.** Same model (issuing API plus real-time authorization webhook). Worth a quote comparison; the design transfers almost unchanged.
+- **No issuing.** Stay with track, remind, guide and approve. No compliance cost. Agent spending outside the marketplace is then limited by rules and approvals, not by the card network.
 
-## Suggested plan
+## Plan
 
-1. Business: apply for Stripe Issuing, get the legal opinion on prepaid balances, and decide the three policy questions above.
-2. Build in test mode: `cards` + `card_authorizations`, the authorization webhook reusing the wallet lock, capture/release/refund, reconciliation job, passkey-approved creation, pause with contract acknowledgment.
-3. First real use: **single-use grocery cards.** Smallest blast radius, and the clearest benefit, because the approved total becomes a hard limit.
-4. Then: subscription cards with move-a-subscription guidance, then price-watch purchases.
+1. Business: Stripe Issuing application and legal opinion.
+2. Done already: risk consent, per-site browser permissions, activity log, grocery order approvals, subscription price ceilings, product picking.
+3. Build in Stripe test mode: `cards` + `card_authorizations`, the authorization webhook matching approvals under the wallet lock, capture/release/refund, reconciliation, passkey-approved card creation, pause with contract acknowledgment.
+4. First real use: **store cards for grocery orders**, where the approved total becomes a hard limit. Then subscription cards.
