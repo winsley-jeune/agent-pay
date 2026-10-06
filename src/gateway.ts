@@ -114,7 +114,7 @@ export async function spendSummary(q: Db | Tx, agentKey: AgentKey) {
   };
 }
 
-async function holdByKey(q: Db | Tx, agentKeyId: string, idempotencyKey: string): Promise<HoldRow | null> {
+export async function holdByKey(q: Db | Tx, agentKeyId: string, idempotencyKey: string): Promise<HoldRow | null> {
   const { rows } = await q.query(`SELECT ${holdColumns} FROM holds WHERE agent_key_id = $1 AND idempotency_key = $2`, [
     agentKeyId,
     idempotencyKey,
@@ -122,7 +122,7 @@ async function holdByKey(q: Db | Tx, agentKeyId: string, idempotencyKey: string)
   return rows[0] ?? null;
 }
 
-async function replay(db: Db, hold: HoldRow, toolId: string): Promise<CallResult> {
+export async function replay(db: Db, hold: HoldRow, toolId: string | null): Promise<CallResult> {
   if (hold.toolId !== toolId) {
     throw new AppError(422, "idempotency_conflict", "this idempotency key was already used for a different tool");
   }
@@ -157,7 +157,7 @@ const tokenHash = (token: string) => createHash("sha256").update(token).digest("
  * Reserve funds for one call. Takes the wallet lock so that balance and
  * budget checks cannot race with another call from the same wallet.
  */
-async function placeHold(
+export async function placeHold(
   db: Db,
   agentKey: AgentKey,
   tool: Tool,
@@ -165,7 +165,14 @@ async function placeHold(
   req: CallRequest,
   subscriptionId: string | null,
   decision: { kind: "auto" | "observe" | "approved" | "covered"; reason: string; envelopeId: string | null },
-  job: { ttlSeconds: number; async: boolean; jobTokenHash: string | null; quoteId: string | null } = { ttlSeconds: config.holdTtlSeconds, async: false, jobTokenHash: null, quoteId: null },
+  job: {
+    ttlSeconds: number;
+    async: boolean;
+    jobTokenHash: string | null;
+    quoteId: string | null;
+    /** A payment outside AgentPay (x402, A2A): there's no marketplace tool. */
+    external?: { protocol: "x402" | "a2a"; target: string };
+  } = { ttlSeconds: config.holdTtlSeconds, async: false, jobTokenHash: null, quoteId: null },
 ): Promise<HoldRow> {
   return withTx(db, async (tx) => {
     // Always the owner's wallet first, then any envelope: per-agent caps count holds from both.
@@ -205,8 +212,8 @@ async function placeHold(
     if (req.approvalId) {
       const { rowCount } = await tx.query(
         `UPDATE approvals SET status = 'used'
-          WHERE id = $1 AND agent_key_id = $2 AND tool_id = $3 AND status = 'approved' AND amount_cents >= $4`,
-        [req.approvalId, agentKey.id, tool.id, amountCents],
+          WHERE id = $1 AND agent_key_id = $2 AND tool_id IS NOT DISTINCT FROM $3 AND status = 'approved' AND amount_cents >= $4`,
+        [req.approvalId, agentKey.id, tool.id || null, amountCents],
       );
       if (!rowCount) {
         throw new AppError(403, "approval_invalid", "approval not found, not approved yet, already used, or for a smaller amount");
@@ -232,11 +239,12 @@ async function placeHold(
 
     const { rows } = await tx.query(
       `INSERT INTO holds (agent_key_id, wallet_account_id, tool_id, idempotency_key, amount_cents, expires_at, subscription_id,
-                          decision, decision_reason, agent_reason, test, async, job_token_hash, quote_id)
-       VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9, $10, $11, $12, $13, $14)
+                          decision, decision_reason, agent_reason, test, async, job_token_hash, quote_id, external_protocol, external_target)
+       VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        RETURNING ${holdColumns}`,
-      [agentKey.id, funding, tool.id, req.idempotencyKey, amountCents, job.ttlSeconds, subscriptionId,
-       decision.kind, decision.reason.slice(0, 300), req.reason?.slice(0, 500) ?? null, agentKey.test, job.async, job.jobTokenHash, job.quoteId],
+      [agentKey.id, funding, tool.id || null, req.idempotencyKey, amountCents, job.ttlSeconds, subscriptionId,
+       decision.kind, decision.reason.slice(0, 300), req.reason?.slice(0, 500) ?? null, agentKey.test, job.async, job.jobTokenHash, job.quoteId,
+       job.external?.protocol ?? null, job.external?.target.slice(0, 500) ?? null],
     );
     const hold: HoldRow = rows[0];
     if (amountCents > 0) {
@@ -275,6 +283,24 @@ export async function captureHold(
     const hold = await lockOpenHold(tx, holdId);
     if (!hold) return false;
     const charged = Math.max(0, Math.min(hold.amountCents, Math.floor(capturedCents)));
+    if (!hold.toolId) {
+      // Paid outside AgentPay with the platform's own USDC: record it against external_settlement, no fee.
+      const sink = hold.test ? await systemAccount(tx, "test_sink") : await systemAccount(tx, "external_settlement");
+      if (hold.amountCents > 0) {
+        await post(
+          tx,
+          "capture",
+          [
+            { accountId: await systemAccount(tx, "holds"), amountCents: -hold.amountCents },
+            { accountId: sink, amountCents: charged },
+            { accountId: hold.walletAccountId, amountCents: hold.amountCents - charged },
+          ],
+          `capture ${hold.id} (external payment): ${charged}c of ${hold.amountCents}c held`,
+        );
+      }
+      await tx.query("UPDATE holds SET status = 'captured', captured_cents = $2, result = $3, settled_at = now() WHERE id = $1", [holdId, charged, JSON.stringify(result ?? null)]);
+      return true;
+    }
     const fee = Math.floor((charged * feeBps) / 10_000);
     const tool = (await toolById(tx, hold.toolId))!;
     const { rows } = await tx.query("SELECT account_id FROM providers WHERE id = $1", [tool.providerId]);
@@ -559,8 +585,8 @@ async function runPaidCall(db: Db, agentKey: AgentKey, req: CallRequest, opts: G
 export async function getJob(db: Db, agentKey: AgentKey, callId: string) {
   const { rows } = await db.query(
     `SELECT h.id, h.status, h.async, h.amount_cents AS "heldCents", h.captured_cents AS "chargedCents", h.result, h.error,
-            h.expires_at AS "expiresAt", h.created_at AS "startedAt", h.settled_at AS "finishedAt", t.slug AS tool
-       FROM holds h JOIN tools t ON t.id = h.tool_id WHERE h.id = $1 AND h.agent_key_id = $2`,
+            h.expires_at AS "expiresAt", h.created_at AS "startedAt", h.settled_at AS "finishedAt", COALESCE(t.slug, h.external_protocol) AS tool
+       FROM holds h LEFT JOIN tools t ON t.id = h.tool_id WHERE h.id = $1 AND h.agent_key_id = $2`,
     [callId, agentKey.id],
   );
   const h = rows[0];

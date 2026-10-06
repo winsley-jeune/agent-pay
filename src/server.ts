@@ -36,6 +36,9 @@ import { withTx } from "./db.js";
 import { frozenAt, frozenError, releaseVaultUnlocks, sweepEnvelopes } from "./controls.js";
 import { callPaidTool, completeJob, failJob, getJob, getToolForAgent, requestTaskQuote, spendSummary, sweepExpiredHolds } from "./gateway.js";
 import { publicKeys } from "./signing.js";
+import { a2aGetTask, a2aSend, discoverAgent, payX402 } from "./pay-outside.js";
+import { configuredNetwork, payerAddress } from "./x402.js";
+import { connectOnboarding, connectStatus, handleConnectEvent, payOut, runPayouts, setAutoPayout } from "./payouts.js";
 import { decideCall } from "./controls.js";
 import { balance, history } from "./ledger.js";
 import { migrate } from "./migrate.js";
@@ -100,6 +103,16 @@ export function createApp(db: Db) {
     h(async (req) => {
       const event = verifyStripeEvent(req.body as Buffer, req.header("stripe-signature") ?? "");
       return { result: await handleStripeEvent(db, event as any) };
+    }),
+  );
+
+  // Connect events (seller onboarding, reversed transfers) come from a separate Stripe endpoint with its own secret.
+  app.post(
+    "/api/stripe/connect-webhook",
+    express.raw({ type: "application/json", limit: "1mb" }),
+    h(async (req) => {
+      const event = verifyStripeEvent(req.body as Buffer, req.header("stripe-signature") ?? "", config.stripeConnectWebhookSecret);
+      return { result: await handleConnectEvent(db, event as any) };
     }),
   );
 
@@ -443,7 +456,23 @@ export function createApp(db: Db) {
     ownerOnly,
     h(async (req) => {
       const provider = await providerForUser(db, req.user!.id, String(req.params.id));
-      return { payout: await requestPayout(db, provider, parse(z.object({ amountCents: cents }), req.body).amountCents) };
+      // Moves the earnings aside and transfers them to the seller's Stripe account when it's connected.
+      return payOut(db, provider, parse(z.object({ amountCents: cents }), req.body).amountCents);
+    }),
+  );
+  app.post(
+    "/api/providers/:id/connect",
+    ownerOnly,
+    h(async (req) => connectOnboarding(db, await providerForUser(db, req.user!.id, String(req.params.id)), req.user!.email)),
+  );
+  app.get("/api/providers/:id/connect", ownerOnly, h(async (req) => connectStatus(db, (await providerForUser(db, req.user!.id, String(req.params.id))).id)));
+  app.put(
+    "/api/providers/:id/auto-payout",
+    ownerOnly,
+    h(async (req) => {
+      const provider = await providerForUser(db, req.user!.id, String(req.params.id));
+      await setAutoPayout(db, provider.id, parse(z.object({ minCents: z.number().int().min(100).nullable() }), req.body).minCents);
+      return connectStatus(db, provider.id);
     }),
   );
 
@@ -496,6 +525,53 @@ export function createApp(db: Db) {
   );
   app.get("/api/agent/balance", agentOnly, h(async (req) => spendSummary(db, req.agentKey!)));
   app.get("/api/agent/jobs/:callId", agentOnly, h(async (req) => getJob(db, req.agentKey!, String(req.params.callId))));
+
+  // Paying outside AgentPay: x402 resources and A2A agents, within the owner's controls.
+  const outsideCommon = {
+    maxCents: z.number().int().positive().max(10_000_000),
+    idempotencyKey: z.string().min(1).max(200).optional(),
+    approvalId: z.uuid().optional(),
+    reason: z.string().max(500).optional(),
+    instruction: z.string().max(500).optional(),
+  };
+  app.post(
+    "/api/agent/x402/pay",
+    agentOnly,
+    h(async (req) =>
+      payX402(db, req.agentKey!, parse(z.object({ url: z.string().max(2000), method: z.enum(["GET", "POST"]).optional(), body: z.unknown().optional(), ...outsideCommon }), req.body)),
+    ),
+  );
+  app.get("/api/agent/a2a/card", agentOnly, h(async (req) => discoverAgent(String(req.query.url ?? ""))));
+  app.post(
+    "/api/agent/a2a/send",
+    agentOnly,
+    h(async (req) =>
+      a2aSend(db, req.agentKey!,
+        parse(z.object({ agentUrl: z.string().max(2000), text: z.string().min(1).max(20_000), taskId: z.string().max(200).optional(), contextId: z.string().max(200).optional(), ...outsideCommon }), req.body)),
+    ),
+  );
+  app.post(
+    "/api/agent/a2a/task",
+    agentOnly,
+    h(async (req) => {
+      const { agentUrl, taskId } = parse(z.object({ agentUrl: z.string().max(2000), taskId: z.string().min(1).max(200) }), req.body);
+      return a2aGetTask(agentUrl, taskId);
+    }),
+  );
+  app.get(
+    "/api/controls/x402",
+    ownerOnly,
+    h(async () => {
+      const network = configuredNetwork();
+      let payer: string | null = null;
+      try {
+        payer = payerAddress();
+      } catch {
+        // not configured
+      }
+      return { configured: !!payer, network: network.v1, testnet: network.testnet, payer, usdc: network.usdc, maxCentsPerPayment: config.x402MaxCents };
+    }),
+  );
   app.post(
     "/api/agent/task-quotes",
     agentOnly,
@@ -607,6 +683,7 @@ export function startJobs(db: Db) {
       await releaseVaultUnlocks(db);
       await applyDueChanges(db);
       await completeDelayedApprovals(db);
+      await runPayouts(db);
       for (const o of await renewDueSubscriptions(db)) console.log(`subscription ${o.subscriptionId}: ${o.outcome}${o.reason ? ` (${o.reason})` : ""}`);
     } catch (err) {
       console.error("background job failed", err);

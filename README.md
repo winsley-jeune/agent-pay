@@ -258,7 +258,46 @@ An agent that sells its work is listed like any paid tool, by its developer as a
   - It then calls with the `quoteId`. A quote is good once, for the same input, until it expires, and never above the listed maximum.
   - The owner's rules apply to the quoted price.
 
-The full provider guide is in [docs/providers.md](docs/providers.md). Not built yet: paying out providers' earnings (Stripe Connect plus legal review), and paying agents outside AgentPay (x402, A2A).
+The full provider guide is in [docs/providers.md](docs/providers.md).
+
+### Paying sellers: Stripe Connect
+
+Sellers connect a **Stripe Express** account from the Provider tab. Stripe collects and verifies their identity and bank details; AgentPay never sees them.
+
+- **A payout:** moves the earnings aside in the ledger, then transfers that amount from AgentPay's Stripe balance to the seller's Stripe account. Stripe then pays it to their bank on their own schedule.
+- **Sending it twice is impossible:** the payout id is the Stripe idempotency key.
+- **If a transfer fails:** it's retried up to 5 times, then the earnings go back to the seller's balance. The same happens if Stripe reverses a transfer later.
+- **Automatic payouts:** sellers can choose to be paid whenever their earnings reach an amount they set.
+- **Stripe's events:** onboarding progress and reversed transfers come to `/api/stripe/connect-webhook`, signed with `STRIPE_CONNECT_WEBHOOK_SECRET`.
+
+### Paying outside AgentPay: x402 and A2A
+
+Agents can also pay APIs and agents that aren't in the marketplace, through open protocols. Each payment goes through the owner's controls exactly like a marketplace call:
+- the kill switch
+- the allow-list (`x402` and `a2a` are the tool names)
+- the agent's level and rules
+- envelopes, the per-call maximum and caps
+- approvals
+- the refusal list
+- the why log
+
+AgentPay then pays in **USDC from its own wallet** (`X402_PRIVATE_KEY`, on Base) and charges the owner's credits.
+
+- **x402** (`pay_x402_resource`). Fetches an https address. If it answers 402, AgentPay picks the requirement it can pay and signs an EIP-3009 USDC authorization. Both versions are supported:
+  - v1: `X-PAYMENT` and `X-PAYMENT-RESPONSE`
+  - v2: `PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE` and `PAYMENT-RESPONSE`
+
+  Only the `exact` scheme with USDC on the configured network is accepted. An address that doesn't charge is returned for free.
+- **A2A agents** (`a2a_discover`, `a2a_send`, `a2a_get_task`). These read the agent card and talk JSON-RPC (`message/send`, `tasks/get`). When an agent asks for payment through the x402 extension, AgentPay sends the signed payload on the same task and returns the agent's answer, artifacts and receipt.
+- **When the money comes back.** Once an authorization is sent, the seller can settle it. So the owner gets the money back only when the seller explicitly refuses the payment. An unclear answer is charged and noted in the why log.
+- **Limits:**
+  - The agent sets `max_cents` on every payment.
+  - The server caps each outside payment at `X402_MAX_CENTS`.
+  - Test keys can only pay on Base Sepolia.
+- **Safety of outside addresses:** https only, no private, loopback or metadata addresses (checked on every DNS answer and redirect), 1 MB and 30 s limits.
+- **Keeping the wallet funded.** `external_settlement` in the ledger records the USDC spent for owners. Keep the wallet topped up with USDC; it needs no ETH, because the seller (or its facilitator) pays the gas to settle. `GET /api/controls/x402` shows the wallet address and network.
+
+Not built yet: AP2 mandates, which are a mandate format rather than a payment rail; owner approvals already work like intent mandates.
 
 ## Test keys for developers
 
@@ -319,6 +358,8 @@ The owner can't turn this off; they buy these themselves.
 | `check_purchase_policy` | Is this item, tool or site something agents must refuse? |
 | `list_purchases` / `record_purchase` / `confirm_received` | Orders, return deadlines and what arrived |
 | `request_task_quote` / `get_job` | Agents selling to agents: get a price per task, follow a long-running job |
+| `pay_x402_resource` | Fetch an https resource, paying it with x402 if it asks (USDC, within the owner's limits) |
+| `a2a_discover` / `a2a_send` / `a2a_get_task` | Find, pay and work with A2A agents (x402 extension) |
 | `approve_test_call` / `add_test_credits` | Test keys only: approve your own calls, add pretend credits |
 | `request_envelope` | Ask the owner to set money aside for this agent |
 | `report_mistake` | Record an incident the agent caused |
@@ -337,6 +378,11 @@ The owner can't turn this off; they buy these themselves.
 | `DRAIN_GUARD` / `DRAIN_GUARD_MIN_CENTS` | `true` / `2000` | Ask when an hour of one agent's spending would be more than half the wallet |
 | `VAULT_UNLOCK_DELAY_HOURS` | `24` | Wait between approving a vault unlock and the money moving |
 | `GUARANTEE_MAX_CENTS` | `0` | Refund guarantee per incident. 0 = none offered |
+| `STRIPE_CONNECT_WEBHOOK_SECRET` | empty | Signing secret of the Stripe endpoint for Connect events (seller onboarding, reversed transfers) at `/api/stripe/connect-webhook` |
+| `X402_PRIVATE_KEY` | empty | AgentPay's USDC wallet for paying x402 sellers and A2A agents (hex private key). Keep it funded |
+| `X402_NETWORK` | `base-sepolia` | `base` for real USDC, `base-sepolia` for testing |
+| `X402_MAX_CENTS` | `2000` | The most one outside payment can be |
+| `AGENTPAY_SIGNING_KEY` | generated | Ed25519 private key (PEM) for signing requests to providers; otherwise one is created and kept in the database |
 | `RESEND_API_KEY` / `EMAIL_FROM` | empty | Send helper invitations by email ([Resend]); `EMAIL_FROM` like `AgentPay <hello@yourdomain.com>` on a domain verified with Resend |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM` | empty | Send helper invitations by text message ([Twilio]); `TWILIO_FROM` is your Twilio number in +1… form. US texting needs A2P 10DLC registration with Twilio |
 
@@ -345,7 +391,7 @@ The owner can't turn this off; they buy these themselves.
 This is a working MVP. Before handling real money:
 
 - **Owner login.** Owners sign in with a bearer token returned at sign-up. Replace this with real authentication (passkey login is the natural fit) and add rate limiting.
-- **Payouts.** These are recorded in the ledger only. Sending money to providers (Stripe Connect) also raises money-transmission and KYC questions in many places; that's a legal step, not just an API call.
+- **Payouts.** Use a Stripe account with Connect enabled, and set the Connect webhook.
 - **Provider secrets.** Upstream `Authorization` headers are stored in plain text. Encrypt them at rest.
 - **Provider endpoints.** These aren't sandboxed. Block private/internal addresses before letting untrusted providers register (SSRF).
 - **Hosting.** Run the API behind HTTPS. Passkeys need HTTPS everywhere except `localhost`.

@@ -47,9 +47,9 @@ const incidentSchema = z.object({
 /** Calls that went through on their own but were flagged for the owner to look at. */
 async function toReview(db: Db, userId: string) {
   const { rows } = await db.query(
-    `SELECT h.id, t.slug AS tool, COALESCE(h.captured_cents, h.amount_cents) AS "amountCents", h.decision_reason AS "decidedBecause",
-            h.agent_reason AS "agentReason", h.status, h.created_at AS "createdAt", k.name AS "agentKeyName"
-       FROM holds h JOIN agent_keys k ON k.id = h.agent_key_id JOIN tools t ON t.id = h.tool_id
+    `SELECT h.id, COALESCE(t.slug, h.external_protocol || ': ' || h.external_target) AS tool, COALESCE(h.captured_cents, h.amount_cents) AS "amountCents",
+            h.decision_reason AS "decidedBecause", h.agent_reason AS "agentReason", h.status, h.created_at AS "createdAt", k.name AS "agentKeyName"
+       FROM holds h JOIN agent_keys k ON k.id = h.agent_key_id LEFT JOIN tools t ON t.id = h.tool_id
       WHERE k.user_id = $1 AND h.decision = 'observe' AND h.reviewed_at IS NULL AND h.status <> 'released'
       ORDER BY h.created_at DESC LIMIT 200`,
     [userId],

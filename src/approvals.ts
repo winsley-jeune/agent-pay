@@ -83,6 +83,10 @@ export function describeApproval(a: Pick<Approval, "kind" | "amountCents" | "too
   }
   if (a.kind === "unfreeze") return "Unfreeze my agents: they can spend again within their limits";
   if (a.kind === "vault_unlock") return `Move ${dollars} from my vault back to my wallet after a ${(a.input as { delayHours?: number }).delayHours}-hour wait`;
+  if (a.kind === "call" && !a.tool) {
+    const i = a.input as { protocol?: string; host?: string };
+    return `Pay ${dollars} to ${i.host} (${i.protocol === "a2a" ? "an outside agent" : "x402"}), in USDC from AgentPay's wallet`;
+  }
   if (a.kind === "call") return `Pay ${dollars} for one call to ${a.tool}`;
   if (a.kind === "subscription") return `Subscribe to ${a.plan} for ${dollars} per ${a.interval}, renewing automatically`;
   return `Renew ${a.plan} at ${dollars} per ${a.interval}`;
@@ -103,6 +107,14 @@ export function approvalTerms(
   const i = (a.input ?? {}) as Record<string, any>;
   switch (a.kind) {
     case "call":
+      if (!a.tool) {
+        return [
+          `One charge of ${usd(a.amountCents)} from your prepaid wallet`,
+          "AgentPay pays the seller in USDC from its own wallet once you approve; it can't be taken back after the seller settles it",
+          "You get the money back only if the seller refuses the payment",
+          "Can be used once, for this payment only",
+        ];
+      }
       return [`One charge of ${usd(a.amountCents)} from your prepaid wallet`, "Not charged if the provider fails or times out", "Can be used once, for this call only"];
     case "subscription":
     case "resume": {

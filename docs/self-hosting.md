@@ -22,6 +22,9 @@ Running AgentPay for yourself is the simplest way to use it. It's your server, y
    - Leave `ALLOW_DEV_CREDIT` unset (false).
    - Keep `REQUIRE_PASSKEY=true`.
    - The owner controls: `COOLING_OFF_HOURS`, `DRAIN_GUARD`, `VAULT_UNLOCK_DELAY_HOURS`, `GUARANTEE_MAX_CENTS`. The defaults are safe.
+   - **Seller payouts:** enable Stripe Connect on your Stripe account. Add a second webhook endpoint "listening to events on Connected accounts" at `https://<your domain>/api/stripe/connect-webhook` for `account.updated` and `transfer.reversed`, and put its secret in `STRIPE_CONNECT_WEBHOOK_SECRET`.
+   - **Outside payments (x402, A2A):** set `X402_PRIVATE_KEY` to a wallet you control, choose `X402_NETWORK` (`base-sepolia` to test, `base` for real USDC), and keep the wallet funded with USDC.
+   - **Request signing:** set `AGENTPAY_SIGNING_KEY` (an Ed25519 private key in PEM) so it isn't stored in the database.
 3. **Run it.** Run `npm ci && npm start` behind a reverse proxy that terminates TLS (Caddy, nginx, a cloud load balancer). The server also runs the background jobs: hold sweeping, renewals, envelope expiry and vault unlocks.
 4. **Sign up and set up** at `/` and keep the owner token safe. Then:
    - Register a passkey (Passkeys tab).

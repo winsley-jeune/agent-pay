@@ -10,7 +10,7 @@ export const MIN_TOPUP_CENTS = 500;
 export const MAX_TOPUP_CENTS = 100_000;
 
 let stripeClient: Stripe | null = null;
-function stripe(): Stripe {
+export function stripe(): Stripe {
   if (!config.stripeSecretKey) throw new AppError(503, "stripe_not_configured", "STRIPE_SECRET_KEY is not set");
   if (!config.stripeSecretKey.startsWith("sk_test_") && process.env.NODE_ENV !== "production") {
     throw new AppError(503, "stripe_live_key", "refusing to use a live Stripe key outside production");

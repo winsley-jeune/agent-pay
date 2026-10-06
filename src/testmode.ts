@@ -16,7 +16,8 @@ export function testKeyAllowed(method: string, path: string): boolean {
   if (path.startsWith("/api/agent/test/")) return true;
   if (method === "GET" && ["/api/agent/tools", "/api/agent/balance", "/api/agent/controls/policy"].includes(path)) return true;
   if (method === "GET" && /^\/api\/agent\/(approvals|jobs)\/[^/]+$/.test(path)) return true;
-  return method === "POST" && ["/api/agent/quote", "/api/agent/call", "/api/agent/task-quotes", "/api/agent/controls/policy/check"].includes(path);
+  if (method === "GET" && path === "/api/agent/a2a/card") return true;
+  return method === "POST" && ["/api/agent/quote", "/api/agent/call", "/api/agent/task-quotes", "/api/agent/controls/policy/check", "/api/agent/x402/pay", "/api/agent/a2a/send", "/api/agent/a2a/task"].includes(path);
 }
 
 function requireTest(agentKey: AgentKey) {

@@ -119,7 +119,10 @@ An async tool may also answer `200` with the result straight away, and it's sett
 
 **Earnings:** a successful call adds the charge minus the platform fee to your provider balance (dashboard, Provider tab).
 
-**Payouts:** they're recorded in the ledger but not yet sent to a bank. Sending them needs Stripe Connect and a legal review; see [us-market.md](us-market.md).
+**Payouts:**
+- **Connect Stripe first.** On the Provider tab, choose **Connect Stripe**. Stripe collects and checks your details and bank account; AgentPay never sees them.
+- **Paying out:** **Pay out** transfers your earnings to your Stripe account, and Stripe pays them to your bank on your payout schedule. You can also be paid automatically whenever earnings reach an amount you choose.
+- **If something goes wrong:** a transfer that fails, or that Stripe reverses, goes back to your earnings.
 
 ## What you can't sell
 

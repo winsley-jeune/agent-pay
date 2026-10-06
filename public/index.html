@@ -1135,9 +1135,17 @@ async function provider() {
   }
   const d = await api("GET", `/api/providers/${providers[0].id}`);
   const pid = d.provider.id;
+  const connect = await api("GET", `/api/providers/${pid}/connect`).catch(() => ({}));
   el.innerHTML = `
     <div class="card spread"><div><div class="muted small">${esc(d.provider.name)} · earnings available</div><div class="big">${usd(d.earningsCents)}</div></div>
-      <div class="row"><button id="payout" ${d.earningsCents > 0 ? "" : "disabled"}>Request payout of ${usd(d.earningsCents)}</button></div></div>
+      <div class="row"><button id="payout" ${d.earningsCents > 0 ? "" : "disabled"}>Pay out ${usd(d.earningsCents)}</button></div></div>
+    <div class="card"><h3>Getting paid</h3>
+      ${connect.payoutsEnabled
+        ? `<p class="small"><span class="chip ok">Stripe connected</span> Payouts go to your Stripe account, and Stripe pays them to your bank on your payout schedule.</p>`
+        : `<p class="small">Connect a Stripe account to receive your earnings. Stripe collects and checks your details and bank account; AgentPay never sees them.</p>
+           <div class="row"><button class="primary" id="connect">${connect.stripeAccountId ? "Finish Stripe setup" : "Connect Stripe"}</button></div>`}
+      <div class="row" style="margin-top:8px"><label class="small" style="flex-direction:row;align-items:center;gap:6px">Pay out automatically from $<input id="autopay" type="number" step="1" min="1" style="width:90px" value="${connect.autoPayoutMinCents ? connect.autoPayoutMinCents / 100 : ""}" placeholder="off"></label><button id="saveauto">Save</button></div>
+    </div>
     <div class="card"><h3>Tools</h3><div class="table-wrap"><table><tr><th>Tool</th><th>Pricing</th><th>Endpoint</th><th></th></tr>
       ${d.tools.map((t) => `<tr><td><b>${esc(t.slug)}</b><div class="small muted">${esc(t.description)}</div></td>
         <td class="small">${t.pricing.type === "per_call" ? usd(t.pricing.priceCents) + " / call" : usd(t.pricing.priceCentsPerUnit) + " / " + esc(t.pricing.unitsField)}</td>
@@ -1168,7 +1176,17 @@ async function provider() {
       </div><div class="row" style="margin-top:8px"><button id="addplan">Add plan</button></div>
     </div>
     <div class="card"><h3>Payouts</h3><table>${d.payouts.map((p) => `<tr><td>${date(p.createdAt)}</td><td class="num">${usd(p.amountCents)}</td><td><span class="chip">${p.status}</span></td></tr>`).join("") || `<tr><td class="muted">No payouts yet.</td></tr>`}</table></div>`;
-  $("#payout").onclick = act(async () => { await api("POST", `/api/providers/${pid}/payouts`, { amountCents: d.earningsCents }); toast("Payout requested."); provider(); });
+  $("#payout").onclick = act(async () => {
+    const r = await api("POST", `/api/providers/${pid}/payouts`, { amountCents: d.earningsCents });
+    toast(r.status === "paid" ? "Sent to your Stripe account." : r.waitingFor ? `Set aside; it's sent once ${r.waitingFor}.` : "Payout requested.");
+    provider();
+  });
+  if ($("#connect")) $("#connect").onclick = act(async () => { const r = await api("POST", `/api/providers/${pid}/connect`, {}); location.href = r.onboardingUrl; });
+  $("#saveauto").onclick = act(async () => {
+    const v = $("#autopay").value.trim();
+    await api("PUT", `/api/providers/${pid}/auto-payout`, { minCents: v ? Math.round(Number(v) * 100) : null });
+    toast(v ? `Earnings are paid out whenever they reach $${v}.` : "Automatic payouts off."); provider();
+  });
   $("#addtool").onclick = act(async () => {
     const f = (n) => $(`#newtool [name=${n}]`).value.trim();
     await api("POST", `/api/providers/${pid}/tools`, { slug: f("slug"), name: f("name"), description: f("desc") || f("name"), pricingType: f("pricing"), mode: f("mode"), priceCents: toCents(f("price")), upstreamUrl: f("url"), upstreamAuth: f("auth") || undefined });

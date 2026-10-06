@@ -23,6 +23,8 @@ export const config = {
   requirePasskey: process.env.REQUIRE_PASSKEY !== "false",
   stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? "",
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "",
+  // Signing secret of the Stripe webhook endpoint that receives Connect (connected-account) events.
+  stripeConnectWebhookSecret: process.env.STRIPE_CONNECT_WEBHOOK_SECRET ?? "",
   platformFeeBps: Number(process.env.PLATFORM_FEE_BPS ?? 1000),
   allowDevCredit: process.env.ALLOW_DEV_CREDIT === "true",
   holdTtlSeconds: Number(process.env.HOLD_TTL_SECONDS ?? 300),
@@ -45,4 +47,10 @@ export const config = {
   twilioAccountSid: process.env.TWILIO_ACCOUNT_SID ?? "",
   twilioAuthToken: process.env.TWILIO_AUTH_TOKEN ?? "",
   twilioFrom: process.env.TWILIO_FROM ?? "",
+  // Paying agents and APIs outside AgentPay over x402 / A2A: AgentPay's own USDC wallet on Base.
+  x402PrivateKey: process.env.X402_PRIVATE_KEY ?? "",
+  x402Network: process.env.X402_NETWORK ?? "base-sepolia",
+  x402MaxCents: Number(process.env.X402_MAX_CENTS ?? 2000),
+  // Development only: let agents pay http://localhost sellers.
+  allowLocalHttpOutbound: process.env.ALLOW_LOCAL_HTTP_OUTBOUND === "true",
 };

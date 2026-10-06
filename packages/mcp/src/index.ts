@@ -69,6 +69,8 @@ const server = new McpServer(
       "After placing an order, it's tracked as a purchase with a return deadline (list_purchases); ask the owner whether everything arrived and record it with confirm_received. " +
       "Some paid tools are other agents. Tools priced per task need request_task_quote first; call them with the quoteId. " +
       "Async tools return status running: the money is held, not charged, until the result arrives; check with get_job. " +
+      "To pay an API or agent outside AgentPay, use pay_x402_resource (HTTP 402) or a2a_send (A2A agents); always set max_cents to what the owner would accept. " +
+      "These are paid in USDC from AgentPay's wallet and charged to the owner's credits, within the same limits and approvals, and can't be taken back once the seller settles. " +
       "If your key starts with ap_test_, it's a test key: payments are pretend, providers aren't paid, and you can approve your own call approvals with approve_test_call.",
   },
 );
@@ -786,6 +788,68 @@ server.registerTool(
     annotations: { readOnlyHint: true },
   },
   ({ call_id }) => reply(api("GET", `/api/agent/jobs/${encodeURIComponent(call_id)}`)),
+);
+
+// ---------------------------------------------------------------- paying outside AgentPay
+
+const outside = {
+  max_cents: z.number().int().positive().describe("The most you'll pay for this, in cents. Refused if the seller asks more"),
+  idempotency_key: z.string().max(200).optional().describe("Reuse when retrying so it's never paid twice; generated if omitted"),
+  approval_id: z.string().optional().describe("From an earlier pending_approval result, once the owner approved"),
+  reason: z.string().max(500).optional(),
+  instruction: z.string().max(500).optional(),
+};
+
+server.registerTool(
+  "pay_x402_resource",
+  {
+    title: "Fetch a paid web resource (x402)",
+    description:
+      "Fetch an https address that may charge per request with x402 (HTTP 402). If it asks for payment, AgentPay checks the owner's limits, pays in USDC and fetches it. " +
+      "Free if it doesn't ask. Pass the same idempotency_key to retry safely.",
+    inputSchema: { url: z.string(), method: z.enum(["GET", "POST"]).optional(), body: z.unknown().optional(), ...outside },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  ({ url, method, body, max_cents, idempotency_key, approval_id, reason, instruction }) =>
+    reply(api("POST", "/api/agent/x402/pay", { url, method, body, maxCents: max_cents, idempotencyKey: idempotency_key ?? randomUUID(), approvalId: approval_id, reason, instruction })),
+);
+
+server.registerTool(
+  "a2a_discover",
+  {
+    title: "Look up an A2A agent",
+    description: "Read an A2A agent's card: its name, what it can do (skills), and whether it accepts payment with x402.",
+    inputSchema: { url: z.string().describe("The agent's base address, e.g. https://agent.example.com") },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  ({ url }) => reply(api("GET", `/api/agent/a2a/card?url=${encodeURIComponent(url)}`)),
+);
+
+server.registerTool(
+  "a2a_send",
+  {
+    title: "Ask an A2A agent to do something",
+    description:
+      "Send a message to an A2A agent. If it asks to be paid (x402 extension), AgentPay pays within the owner's limits and max_cents and sends the payment; " +
+      "you get the agent's answer, or a task to check later with a2a_get_task.",
+    inputSchema: { agent_url: z.string(), text: z.string(), task_id: z.string().optional(), context_id: z.string().optional(), ...outside },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  },
+  ({ agent_url, text, task_id, context_id, max_cents, idempotency_key, approval_id, reason, instruction }) =>
+    reply(api("POST", "/api/agent/a2a/send", {
+      agentUrl: agent_url, text, taskId: task_id, contextId: context_id, maxCents: max_cents, idempotencyKey: idempotency_key ?? randomUUID(), approvalId: approval_id, reason, instruction,
+    })),
+);
+
+server.registerTool(
+  "a2a_get_task",
+  {
+    title: "Check an A2A task",
+    description: "Status and results of a task you gave an A2A agent. No payment.",
+    inputSchema: { agent_url: z.string(), task_id: z.string() },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  ({ agent_url, task_id }) => reply(api("POST", "/api/agent/a2a/task", { agentUrl: agent_url, taskId: task_id })),
 );
 
 // ---------------------------------------------------------------- purchases
