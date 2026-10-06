@@ -63,7 +63,7 @@ The repository is **private** and stays private until you decide to flip it. Eve
    - r/ClaudeAI and r/mcp
    - the MCP Discord
    - X / Bluesky
-8. **Later:** the Claude Connectors Directory and ChatGPT apps need a hosted HTTPS server with OAuth sign-in. That's step 1 in [distribution.md](distribution.md), and it's the hosted version covered in [us-market.md](us-market.md).
+8. **Later:** the Claude Connectors Directory and ChatGPT apps need a hosted HTTPS server with OAuth sign-in. That's step 1 in [distribution.md](distribution.md), and it's the hosted version covered in [us-market.md](us-market.md). **Update 2026-10-06:** both directories ban software that moves money; see [marketplaces.md](marketplaces.md).
 
 ## Keep in mind
 

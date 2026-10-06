@@ -25,7 +25,7 @@ const INVITE_DAYS = 7;
 export const COSIGN_KINDS = ["unfreeze", "vault_unlock", "browser_access", "risk_consent", "envelope", "buy_mandate"];
 
 /** Why-log entries a helper is alerted to. */
-const ALERT_KINDS = [
+export const ALERT_KINDS = [
   "call_needs_approval", "call_refused", "freeze", "unfreeze", "approved", "denied", "cosign_waiting", "incident_reported",
   "envelope_funded", "vault_lock", "vault_unlock", "mandate_used", "protection_change", "helper_change", "agent_key_created", "agent_limits_change",
   "scam_check_flagged", "purchase_problem",

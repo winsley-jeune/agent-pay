@@ -57,7 +57,11 @@ export function channelConfigured(channel: Channel): boolean {
 }
 
 export async function sentInLastDay(q: Db | Tx, userId: string): Promise<number> {
-  const { rows } = await q.query("SELECT count(*)::int AS n FROM notifications WHERE user_id = $1 AND status = 'sent' AND created_at > now() - interval '1 day'", [userId]);
+  // Only invitations reach other people, so only they count toward the anti-spam limit.
+  const { rows } = await q.query(
+    "SELECT count(*)::int AS n FROM notifications WHERE user_id = $1 AND status = 'sent' AND purpose = 'helper_invite' AND created_at > now() - interval '1 day'",
+    [userId],
+  );
   return rows[0].n;
 }
 
@@ -99,7 +103,7 @@ export async function send(
   let delivery: Delivery;
   if (!channelConfigured(msg.channel)) {
     delivery = { status: "not_configured" };
-  } else if ((await sentInLastDay(db, userId)) >= DAILY_SEND_LIMIT) {
+  } else if (msg.purpose === "helper_invite" && (await sentInLastDay(db, userId)) >= DAILY_SEND_LIMIT) {
     throw new AppError(429, "send_limit", `at most ${DAILY_SEND_LIMIT} messages a day; try again tomorrow`);
   } else {
     try {

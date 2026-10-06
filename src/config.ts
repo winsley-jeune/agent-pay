@@ -51,6 +51,21 @@ export const config = {
   x402PrivateKey: process.env.X402_PRIVATE_KEY ?? "",
   x402Network: process.env.X402_NETWORK ?? "base-sepolia",
   x402MaxCents: Number(process.env.X402_MAX_CENTS ?? 2000),
+  // Payment safety: ask the owner when a payment is this many times the last one to the same seller,
+  // or repeats the same payment within this many seconds.
+  priceJumpRatio: Number(process.env.PRICE_JUMP_RATIO ?? 1.5),
+  duplicateWindowSeconds: Number(process.env.DUPLICATE_WINDOW_SECONDS ?? 600),
+  // Optional: notifications by Telegram (a bot you create with @BotFather).
+  telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
+  // OpenAI-compatible AI model gateway (/v1/chat/completions) billed to agents' wallets.
+  llmUpstreamUrl: process.env.LLM_UPSTREAM_URL ?? "",
+  llmUpstreamKey: process.env.LLM_UPSTREAM_KEY ?? "",
+  // {"model-id": {"inCentsPerMillion": 15, "outCentsPerMillion": 60}, ...}
+  llmModels: process.env.LLM_MODELS ?? "",
+  // {"eco": "model-id", "auto": "model-id", "premium": "model-id"}
+  llmProfiles: process.env.LLM_PROFILES ?? "",
+  llmDefaultMaxTokens: Number(process.env.LLM_DEFAULT_MAX_TOKENS ?? 1024),
+  llmMaxTokens: Number(process.env.LLM_MAX_TOKENS ?? 8192),
   // Development only: let agents pay http://localhost sellers.
   allowLocalHttpOutbound: process.env.ALLOW_LOCAL_HTTP_OUTBOUND === "true",
 };

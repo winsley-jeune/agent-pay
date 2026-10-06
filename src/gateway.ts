@@ -13,6 +13,7 @@ import { enforce } from "./policy.js";
 import { createHash, randomBytes } from "node:crypto";
 import { DEFAULT_MAX_JOB_SECONDS } from "./registry.js";
 import { signatureHeaders } from "./signing.js";
+import { checkSafety } from "./safety.js";
 
 export interface CallRequest {
   tool: string;
@@ -170,8 +171,11 @@ export async function placeHold(
     async: boolean;
     jobTokenHash: string | null;
     quoteId: string | null;
-    /** A payment outside AgentPay (x402, A2A): there's no marketplace tool. */
-    external?: { protocol: "x402" | "a2a"; target: string };
+    /** A payment outside AgentPay (x402, A2A, the LLM gateway): there's no marketplace tool. */
+    external?: { protocol: "x402" | "a2a" | "llm"; target: string };
+    /** Same payee, amount and input: used to spot duplicates. */
+    fingerprint?: string;
+    conversationId?: string;
   } = { ttlSeconds: config.holdTtlSeconds, async: false, jobTokenHash: null, quoteId: null },
 ): Promise<HoldRow> {
   return withTx(db, async (tx) => {
@@ -239,12 +243,13 @@ export async function placeHold(
 
     const { rows } = await tx.query(
       `INSERT INTO holds (agent_key_id, wallet_account_id, tool_id, idempotency_key, amount_cents, expires_at, subscription_id,
-                          decision, decision_reason, agent_reason, test, async, job_token_hash, quote_id, external_protocol, external_target)
-       VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                          decision, decision_reason, agent_reason, test, async, job_token_hash, quote_id, external_protocol, external_target,
+                          fingerprint, conversation_id)
+       VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
        RETURNING ${holdColumns}`,
       [agentKey.id, funding, tool.id || null, req.idempotencyKey, amountCents, job.ttlSeconds, subscriptionId,
        decision.kind, decision.reason.slice(0, 300), req.reason?.slice(0, 500) ?? null, agentKey.test, job.async, job.jobTokenHash, job.quoteId,
-       job.external?.protocol ?? null, job.external?.target.slice(0, 500) ?? null],
+       job.external?.protocol ?? null, job.external?.target.slice(0, 500) ?? null, job.fingerprint ?? null, job.conversationId?.slice(0, 200) ?? null],
     );
     const hold: HoldRow = rows[0];
     if (amountCents > 0) {
@@ -485,13 +490,15 @@ async function runPaidCall(db: Db, agentKey: AgentKey, req: CallRequest, opts: G
     });
   }
 
+  // Price jumps and duplicates go to the owner even when the agent's level would pay on its own.
+  const safety = coverage ? null : await checkSafety(db, agentKey, { target: tool.id, outside: false, amountCents, input: req.input, checkDuplicates: tool.pricingType === "quoted" });
   let decision: Parameters<typeof placeHold>[6];
   if (coverage) {
     decision = { kind: "covered", reason: "included in a subscription", envelopeId: null };
   } else if (req.approvalId) {
     decision = { kind: "approved", reason: "approved by the owner with a passkey", envelopeId: null };
   } else {
-    const d = await decideCall(db, agentKey, tool, amountCents);
+    const d = safety?.ask ? ({ outcome: "approve", reason: safety.ask, envelopeId: null } as const) : await decideCall(db, agentKey, tool, amountCents);
     if (d.outcome === "approve") {
       const approvalId = await createCallApproval(db, agentKey, tool, amountCents, req.input, { why: d.reason, agentReason: req.reason });
       return {
@@ -514,6 +521,7 @@ async function runPaidCall(db: Db, agentKey: AgentKey, req: CallRequest, opts: G
     async: tool.mode === "async",
     jobTokenHash: jobToken ? tokenHash(jobToken) : null,
     quoteId: quoted?.id ?? null,
+    fingerprint: safety?.fingerprint,
   };
   let hold: HoldRow;
   try {

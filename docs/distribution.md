@@ -36,7 +36,7 @@ AgentPay connects to those systems instead of replacing them: the owner's contro
    - list it in the official MCP Registry
    - package it as a Claude Code plugin, for developers
    - it then works in any MCP app (Cursor, VS Code, Gemini CLI)
-3. **The big directories:** the Claude Connectors Directory (listings start as Community, then can become Verified) and the ChatGPT app catalogue. Expect extra scrutiny for anything that moves money; read each platform's rules on financial apps before submitting.
+3. **The big directories:** the Claude Connectors Directory (listings start as Community, then can become Verified) and the ChatGPT app catalogue. Expect extra scrutiny for anything that moves money; read each platform's rules on financial apps before submitting. **Update 2026-10-06:** Anthropic (Software Directory Policy §4.A) and OpenAI both ban software that moves money. A listing needs written permission or a read-only build; see [marketplaces.md](marketplaces.md).
 4. **Let the wallet pay x402 services.** When a tool answers "payment required", AgentPay pays it from the wallet, within the owner's limits. That opens thousands of existing paid tools without each joining the marketplace. Catch: x402 settles mostly in stablecoins, which brings back crypto and compliance questions.
 5. **Let tool builders charge through AgentPay:** a wrapper that adds per-call billing to any existing MCP server. Builders bring their own users, so this channel grows through them.
 6. **Make approvals compatible with AP2**, so an owner's approval is also proof a standards-compliant merchant accepts.

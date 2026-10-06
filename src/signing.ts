@@ -86,3 +86,9 @@ export async function publicKeys(db: Db) {
   }
   return { keys, signed: ["agentpay-v1", "phase", "id", "tool", "heldCents", "agentId", "timestamp", "sha256(body)"] };
 }
+
+/** Sign arbitrary bytes with AgentPay's key (evidence bundles). */
+export async function signBytes(db: Db, bytes: Buffer): Promise<{ kid: string; signature: string }> {
+  const { kid, key } = await signingKey(db);
+  return { kid, signature: sign(null, bytes, key).toString("base64url") };
+}

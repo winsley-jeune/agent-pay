@@ -97,3 +97,62 @@ export function verifyAgentPayRequest(opts: {
     phase, id, tool, heldCents: Number(held), agentId, test: header(opts.headers, "x-agentpay-test") === "true", timestamp: Number(timestamp), keyId,
   };
 }
+
+// ---------------------------------------------------------------- evidence bundles
+
+/** Sorted-key JSON, matching how AgentPay hashes an entry's data. */
+function canonical(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canonical);
+  if (v && typeof v === "object") return Object.fromEntries(Object.keys(v).sort().map((k) => [k, canonical((v as Record<string, unknown>)[k])]));
+  return v;
+}
+
+export interface EvidenceBundle {
+  format: string;
+  issuer: string;
+  userId: string;
+  firstSeq: number;
+  lastSeq: number;
+  anchor: string;
+  head: string;
+  exportedAt: string;
+  reason: string | null;
+  entries: {
+    seq: number; createdAt: string; actor: string; agentKeyId: string | null; kind: string; summary: string;
+    instruction: string | null; reason: string | null; result: string | null; data: Record<string, unknown>; prevHash: string; hash: string;
+  }[];
+  signature: { kid: string; signature: string };
+}
+
+export type EvidenceResult = { ok: true; entries: number; firstSeq: number; lastSeq: number; issuer: string } | { ok: false; problem: string; seq?: number };
+
+/**
+ * Check an evidence bundle exported by an AgentPay server: every entry's hash,
+ * the chain from the anchor to the head, and AgentPay's signature on the header.
+ * Pass the issuer's keys (fetchAgentPayKeys(bundle.issuer)), not keys taken from the bundle.
+ */
+export function verifyEvidenceBundle(bundle: EvidenceBundle, keys: AgentPayKey[]): EvidenceResult {
+  if (bundle.format !== "agentpay-evidence-v1") return { ok: false, problem: `unknown format ${bundle.format}` };
+  if (!bundle.entries?.length) return { ok: false, problem: "no entries" };
+  let prev = bundle.anchor;
+  let expectedSeq = bundle.firstSeq;
+  for (const e of bundle.entries) {
+    if (e.seq !== expectedSeq) return { ok: false, problem: "an entry is missing or out of order", seq: expectedSeq };
+    if (e.prevHash !== prev) return { ok: false, problem: "the chain is broken", seq: e.seq };
+    const hash = createHash("sha256")
+      .update(prev)
+      .update(JSON.stringify([bundle.userId, e.seq, e.createdAt, e.actor, e.agentKeyId ?? null, e.kind, e.summary, e.instruction ?? null, e.reason ?? null, e.result ?? null, canonical(e.data ?? {})]))
+      .digest("hex");
+    if (hash !== e.hash) return { ok: false, problem: "an entry was changed", seq: e.seq };
+    prev = e.hash;
+    expectedSeq++;
+  }
+  if (bundle.lastSeq !== expectedSeq - 1 || bundle.head !== prev) return { ok: false, problem: "the header doesn't match the entries" };
+  const key = keys.find((k) => k.kid === bundle.signature?.kid);
+  if (!key) return { ok: false, problem: `unknown AgentPay key ${bundle.signature?.kid}` };
+  const header = Buffer.from(JSON.stringify([bundle.format, bundle.issuer, bundle.userId, bundle.firstSeq, bundle.lastSeq, bundle.anchor, bundle.head, bundle.exportedAt, bundle.reason]));
+  if (!verify(null, header, createPublicKey(key.publicKeyPem), Buffer.from(bundle.signature.signature, "base64url"))) {
+    return { ok: false, problem: "AgentPay's signature doesn't match: the bundle wasn't issued by this server or was changed" };
+  }
+  return { ok: true, entries: bundle.entries.length, firstSeq: bundle.firstSeq, lastSeq: bundle.lastSeq, issuer: bundle.issuer };
+}

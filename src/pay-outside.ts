@@ -10,6 +10,7 @@ import { captureHold, checkToolAllowed, holdByKey, placeHold, releaseHold, repla
 import { balance } from "./ledger.js";
 import { safeFetch, type OutboundOptions } from "./outbound.js";
 import { refusalError, screen } from "./policy.js";
+import { checkSafety, recordPayee } from "./safety.js";
 import type { Tool } from "./registry.js";
 import { atomicToCents, configuredNetwork, parsePaymentRequired, parseSettlement, pickRequirement, signPayment, type PaymentRequired, type Requirement } from "./x402.js";
 
@@ -75,11 +76,13 @@ export async function payOutside(db: Db, agentKey: AgentKey, p: OutsidePayment, 
   }
 
   const input = { protocol: p.protocol, host: p.host, target: p.target, payTo: p.requirement.payTo, network: p.requirement.network, amountAtomic: p.requirement.amountAtomic.toString() };
+  // Changed payment address, price jump, duplicate, or an earlier unclear payment to the same seller.
+  const safety = await checkSafety(db, agentKey, { target: p.host, outside: true, amountCents, input: { target: p.target, payTo: p.requirement.payTo }, payTo: p.requirement.payTo });
   let decision: Parameters<typeof placeHold>[6];
   if (p.approvalId) {
     decision = { kind: "approved", reason: "approved by the owner with a passkey", envelopeId: null };
   } else {
-    const d = await decideCall(db, agentKey, tool, amountCents);
+    const d = safety.ask ? ({ outcome: "approve", reason: safety.ask, envelopeId: null } as const) : await decideCall(db, agentKey, tool, amountCents);
     if (d.outcome === "approve") {
       const approvalId = await createCallApproval(db, agentKey, tool, amountCents, input, { why: d.reason, agentReason: p.reason });
       await log(db, agentKey, p, "call_needs_approval", `Asked the owner to approve $${(amountCents / 100).toFixed(2)} to ${p.host} (${p.protocol})`, d.reason, { approvalId });
@@ -92,7 +95,7 @@ export async function payOutside(db: Db, agentKey: AgentKey, p: OutsidePayment, 
   }
 
   const hold = await placeHold(db, agentKey, tool, amountCents, { tool: p.protocol, input, idempotencyKey: p.idempotencyKey, approvalId: p.approvalId, reason: p.reason }, null, decision, {
-    ttlSeconds: config.holdTtlSeconds, async: false, jobTokenHash: null, quoteId: null, external: { protocol: p.protocol, target: p.target },
+    ttlSeconds: config.holdTtlSeconds, async: false, jobTokenHash: null, quoteId: null, external: { protocol: p.protocol, target: p.target }, fingerprint: safety.fingerprint,
   });
 
   let outcome: SettleOutcome;
@@ -111,7 +114,13 @@ export async function payOutside(db: Db, agentKey: AgentKey, p: OutsidePayment, 
   }
   const result = outcome.outcome === "paid" ? { response: outcome.result, receipt: outcome.receipt } : { response: outcome.result, unclear: outcome.error };
   await captureHold(db, hold.id, amountCents, result);
-  if (outcome.outcome === "paid") await db.query("UPDATE holds SET external_receipt = $2 WHERE id = $1", [hold.id, JSON.stringify(outcome.receipt ?? null)]);
+  if (outcome.outcome === "paid") {
+    await db.query("UPDATE holds SET external_receipt = $2 WHERE id = $1", [hold.id, JSON.stringify(outcome.receipt ?? null)]);
+    await recordPayee(db, agentKey.userId, p.host, p.requirement.payTo);
+  } else {
+    // Possibly paid: nothing more goes to this seller until the owner confirms or gets a refund.
+    await db.query("UPDATE holds SET external_status = 'unclear' WHERE id = $1", [hold.id]);
+  }
   await log(
     db, agentKey, p, "call_paid", `Paid $${(amountCents / 100).toFixed(2)} to ${p.host} (${p.protocol}) in USDC`,
     outcome.outcome === "unclear" ? `the seller's answer was unclear (${outcome.error}); charged because it may have settled` : null,

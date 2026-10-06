@@ -123,14 +123,14 @@ These are estimates from the comparables above, not forecasts.
 | 4 | **x402 Foundation (Linux Foundation) and Coinbase Developer Platform** [V/K] | Ecosystem listing, developer-relations promotion, reference-implementation status; no grant program found | ★★★★ | "The spending-control layer for x402" |
 | 5 | **AARP AgeTech Collaborative** [V] | Connections, **pilots with AARP members**, introductions to investors and companies; not a direct funder | ★★★★ | Protected accounts, the scam check and the gift-card and crypto refusals fit exactly |
 | 6 | **FIDO Alliance AP2 working groups** [V] | A standards seat; AP2 is moving there; paid membership tiers [K] | ★★★★ | Passkey approval of agent purchases is their exact topic |
-| 7 | **Base Batches and Base Ecosystem Fund** [V] | **$100k** plus a demo day; pre-seed and seed investment for payments and AI-agent companies | ★★★★ | Needs a company |
+| 7 | **Base Batches and Base Ecosystem Fund** [V] | **$100k** plus a demo day; pre-seed and seed investment for payments and AI-agent companies | ★★★★ | Needs a company. **Update 2026-10-06:** Batches 004 closed Sep 9 and no 005 is announced; see [funding.md](funding.md) |
 | 8 | **Anthropic** [V] | Claude for Open Source (6 months of Claude Max 20x) once adoption meets their bar (for example, 200k monthly downloads or 20+ outside contributors); MCP Registry and plugin showcase now | ★★★ (★★★★ later) | No cash grants known; the value is visibility |
 | 9 | **NIA SBIR/STTR** (National Institute on Aging) [K] | Phase I about $300k, Phase II about $2M; deadlines around Jan 5, Apr 5 and Sep 5 | ★★★★ with a company | Needs a US small business. Slow, but large and doesn't take equity |
 | 10 | **Y Combinator W27** [V] | Standard deal [K], plus $12M+ in partner credits; **deadline Nov 2, 8 pm PT** | ★★★ | Only if you want to build a company around it |
 
 **Also worth setting up:**
 - **GitHub Sponsors:** turn it on at launch.
-- **The Gitcoin GG24 open-source round** [V]: cheap to try.
+- **The Gitcoin GG24 open-source round** [V]: cheap to try. **Update 2026-10-06:** no 2026 round confirmed; see [funding.md](funding.md).
 - **Cloudflare:** startup credits of $10k–$350k need a company [V]; it also co-announced x402, so it's a good demo partner.
 - **Stripe:** a partner and distribution route (Stripe Apps, its agent toolkit, ACP), not a funder [K].
 - **EverSafe, SAGE and AARP's Fraud Watch Network:** co-marketing for the older-adults features [K].

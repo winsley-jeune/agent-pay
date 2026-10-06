@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { approvalStatusForAgent, approve, deny, listApprovals, startApproval } from "./approvals.js";
 import {
+  agentKeyById,
   agentKeyByToken,
   userById,
   createAgentKey,
@@ -36,6 +37,10 @@ import { withTx } from "./db.js";
 import { frozenAt, frozenError, releaseVaultUnlocks, sweepEnvelopes } from "./controls.js";
 import { callPaidTool, completeJob, failJob, getJob, getToolForAgent, requestTaskQuote, spendSummary, sweepExpiredHolds } from "./gateway.js";
 import { publicKeys } from "./signing.js";
+import { chatCompletion, listModels } from "./llm-gateway.js";
+import { addChannel, EVENTS as NOTIFY_EVENTS, KINDS as NOTIFY_KINDS, listChannels, removeChannel, runNotifications, sendTest } from "./notifications.js";
+import { calendarFeed, createCalendarToken, revokeCalendarToken } from "./calendar.js";
+import { describeChanges, dryRun, parsePolicy } from "./policy-language.js";
 import { a2aGetTask, a2aSend, discoverAgent, payX402 } from "./pay-outside.js";
 import { configuredNetwork, payerAddress } from "./x402.js";
 import { connectOnboarding, connectStatus, handleConnectEvent, payOut, runPayouts, setAutoPayout } from "./payouts.js";
@@ -118,6 +123,7 @@ export function createApp(db: Db) {
 
   // Grocery list photos need a larger body; body-parser skips bodies that are already parsed.
   app.use(["/api/grocery/photo", "/api/agent/grocery/photo"], express.json({ limit: "8mb" }));
+  app.use("/v1/chat/completions", express.json({ limit: "2mb" }));
   app.use(express.json({ limit: "256kb" }));
 
   // A trusted helper acts on someone else's account with the X-AgentPay-Account header,
@@ -274,6 +280,38 @@ export function createApp(db: Db) {
       // On a protected account, limit changes wait out the delay (revoking is still immediate).
       if ((await getProtection(db, req.user!.id)).protectedAt) return scheduleAgentLimits(db, req.user!.id, String(req.params.id), limits);
       return { agentKey: await updateAgentKeyLimits(db, req.user!.id, String(req.params.id), limits) };
+    }),
+  );
+  // Plain-English rules: preview (with a dry run over the last 30 days), then apply.
+  const policyFor = async (req: Request) => {
+    const key = await agentKeyById(db, String(req.params.id));
+    if (!key || key.userId !== req.user!.id || key.revokedAt) throw new AppError(404, "not_found", "agent key not found");
+    const { text } = parse(z.object({ text: z.string().min(3).max(2000), apply: z.boolean().optional() }), req.body);
+    const parsed = parsePolicy(text, (await listTools(db)).map((t) => ({ slug: t.slug, name: t.name })));
+    return { key, text, parsed };
+  };
+  app.post(
+    "/api/agent-keys/:id/policy/preview",
+    ownerOnly,
+    h(async (req) => {
+      const { key, parsed } = await policyFor(req);
+      return { ...parsed, changes: describeChanges(key, parsed.limits), dryRun: await dryRun(db, key, parsed.limits) };
+    }),
+  );
+  app.post(
+    "/api/agent-keys/:id/policy",
+    ownerOnly,
+    h(async (req) => {
+      const { key, text, parsed } = await policyFor(req);
+      if (parsed.notUnderstood.length) {
+        throw new AppError(400, "policy_not_understood", `I didn't understand: "${parsed.notUnderstood.join('", "')}". Rephrase it, or remove it.`, { notUnderstood: parsed.notUnderstood });
+      }
+      const changes = describeChanges(key, parsed.limits);
+      await withTx(db, (tx) =>
+        auditTx(tx, req.user!.id, { actor: "owner", kind: "agent_limits_change", summary: `New rules for "${key.name}"`, instruction: text, result: changes.join("; ") || "no change" }),
+      );
+      if ((await getProtection(db, req.user!.id)).protectedAt) return scheduleAgentLimits(db, req.user!.id, key.id, parsed.limits);
+      return { agentKey: await updateAgentKeyLimits(db, req.user!.id, key.id, parsed.limits), changes };
     }),
   );
   app.delete(
@@ -641,6 +679,67 @@ export function createApp(db: Db) {
 
   // ------------------------------------------------------------ demo provider + dashboard
 
+  // OpenAI-compatible AI model gateway: baseURL = <server>/v1, apiKey = an agent key.
+  const openAiError = (err: unknown, res: Response) => {
+    const e = err instanceof AppError ? err : new AppError(500, "internal", "internal error");
+    if (!(err instanceof AppError)) console.error(err);
+    res.status(e.status).json({ error: { message: e.message, type: e.code, code: e.code, ...(e.details ? { details: e.details } : {}) } });
+  };
+  app.get("/v1/models", agentOnly, (_req, res) => {
+    try {
+      res.json(listModels());
+    } catch (err) {
+      openAiError(err, res);
+    }
+  });
+  app.post("/v1/chat/completions", agentOnly, (req, res) => {
+    const cap = req.header("x-agentpay-max-cents");
+    chatCompletion(db, req.agentKey!, {
+      body: req.body ?? {},
+      conversationId: req.header("x-agentpay-conversation") ?? undefined,
+      conversationMaxCents: cap && /^\d+$/.test(cap) ? Number(cap) : undefined,
+      approvalId: req.header("x-agentpay-approval-id") ?? undefined,
+      idempotencyKey: req.header("idempotency-key") ?? undefined,
+    }).then(
+      (r) => res.set({ "x-agentpay-charged-cents": String(r.chargedCents), "x-agentpay-call-id": r.callId }).json(r.body),
+      (err) => openAiError(err, res),
+    );
+  });
+
+  // Notifications: email, text, Telegram, Discord, signed webhooks.
+  app.get("/api/notifications", ownerOnly, h(async (req) => ({ channels: await listChannels(db, req.user!.id), telegramEnabled: !!config.telegramBotToken })));
+  app.post(
+    "/api/notifications",
+    ownerOnly,
+    h(async (req) =>
+      addChannel(db, req.user!.id,
+        parse(z.object({ kind: z.enum(NOTIFY_KINDS), target: z.string().min(3).max(500), events: z.array(z.enum(NOTIFY_EVENTS)).max(4).optional() }), req.body)),
+    ),
+  );
+  app.delete(
+    "/api/notifications/:id",
+    ownerOnly,
+    h(async (req) => {
+      await removeChannel(db, req.user!.id, String(req.params.id));
+    }),
+  );
+  app.post("/api/notifications/:id/test", ownerOnly, h(async (req) => sendTest(db, req.user!.id, String(req.params.id))));
+
+  // Calendar feed: the URL carries its own secret, for calendar apps.
+  app.post("/api/calendar/token", ownerOnly, h(async (req) => createCalendarToken(db, req.user!.id)));
+  app.delete(
+    "/api/calendar/token",
+    ownerOnly,
+    h(async (req) => {
+      await revokeCalendarToken(db, req.user!.id);
+    }),
+  );
+  app.get("/api/calendar/:file", (req, res, next) => {
+    const m = String(req.params.file).match(/^(ap_cal_[\w-]+)\.ics$/);
+    if (!m) return next(new AppError(404, "not_found", "no calendar at this address"));
+    calendarFeed(db, m[1]).then((ics) => res.type("text/calendar; charset=utf-8").send(ics), next);
+  });
+
   app.use("/sample", sampleRouter());
   app.get("/vendor/simplewebauthn-browser.js", (_req, res) => {
     res.sendFile(fileURLToPath(new URL("../node_modules/@simplewebauthn/browser/dist/bundle/index.umd.min.js", import.meta.url)));
@@ -684,6 +783,7 @@ export function startJobs(db: Db) {
       await applyDueChanges(db);
       await completeDelayedApprovals(db);
       await runPayouts(db);
+      await runNotifications(db);
       for (const o of await renewDueSubscriptions(db)) console.log(`subscription ${o.subscriptionId}: ${o.outcome}${o.reason ? ` (${o.reason})` : ""}`);
     } catch (err) {
       console.error("background job failed", err);

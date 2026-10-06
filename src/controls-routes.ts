@@ -25,6 +25,8 @@ import { guaranteePolicy, INCIDENT_KINDS, listIncidents, reportIncident, updateI
 import { listMandates } from "./mandates.js";
 import { listGrants, normalizeSite } from "./permissions.js";
 import { listPurchases, purchaseReminders } from "./purchases.js";
+import { listUnclear, resolveUnclear } from "./safety.js";
+import { exportEvidence } from "./evidence.js";
 import { policySummary, refusalMessage, screen, screenSite } from "./policy.js";
 
 const cents = z.number().int().positive().max(10_000_000);
@@ -95,8 +97,23 @@ export function controlsRoutes(db: Db) {
     }),
   );
 
+  // Outside payments whose outcome wasn't clear: the owner says whether they went through.
+  r.get("/unclear", h(async (req) => ({ payments: await listUnclear(db, uid(req)) })));
+  r.post("/unclear/:id", h(async (req) => resolveUnclear(db, uid(req), String(req.params.id), parse(z.object({ paid: z.boolean() }), req.body).paid)));
+
   r.get("/audit", h(async (req) => ({ entries: await listAudit(db, uid(req)) })));
   r.get("/audit/verify", h(async (req) => verifyAudit(db, uid(req))));
+  // A signed, independently checkable slice of the why log (for disputes, refunds, the guarantee).
+  r.get(
+    "/evidence",
+    h(async (req) =>
+      exportEvidence(db, uid(req), {
+        from: typeof req.query.from === "string" ? req.query.from : undefined,
+        to: typeof req.query.to === "string" ? req.query.to : undefined,
+        incidentId: typeof req.query.incident === "string" ? req.query.incident : undefined,
+      }),
+    ),
+  );
 
   r.get("/policy", h(async () => policySummary()));
   r.post("/policy/check", h(async (req) => checkPolicy(req.body)));
@@ -131,6 +148,7 @@ export function controlsRoutes(db: Db) {
         listPurchases(db, userId, { open: true }),
         purchaseReminders(db, userId),
       ]);
+      const unclearPayments = await listUnclear(db, userId);
       return {
         frozenAt: frozen,
         agents: await Promise.all(
@@ -156,6 +174,7 @@ export function controlsRoutes(db: Db) {
         toReview: reviews,
         openIncidents: incidents,
         openPurchases: purchases,
+        unclearPayments,
         purchaseReminders: purchaseAlerts,
       };
     }),
